@@ -1,4 +1,30 @@
+"""
+Scaling regression for the Phase 2B binary-Goppa McEliece implementation.
+
+This test verifies, for several parameter sets:
+
+1. Binary Goppa-code construction.
+2. Dimension and rank conditions.
+3. G H^T = 0.
+4. S S^{-1} = I_k.
+5. Vector representation of the secret permutation.
+6. Correct inverse permutation.
+7. G_pub = (S G)[:, P].
+8. Exact McEliece encryption error weight.
+9. Patterson decoding.
+10. Encryption/decryption correctness.
+11. Basic timing measurements.
+
+Phase 2B stores the secret permutation as
+
+    P     : ndarray of shape (n,)
+    P_inv : ndarray of shape (n,)
+
+instead of dense n x n matrices.
+"""
+
 import time
+
 import numpy as np
 
 from mceliece.mceliececipher import McElieceCipher
@@ -20,25 +46,52 @@ BASE_SEED = 20260816
 
 
 # ================================================================
-# Helpers
+# Helper functions
 # ================================================================
 
 def gf2_numpy(M):
     """
-    Convert GF2Matrix to an ordinary uint8 NumPy array
+    Convert GF2Matrix to ordinary uint8 NumPy array
     while preserving its shape.
     """
+
+    if not isinstance(
+        M,
+        GF2Matrix,
+    ):
+        raise TypeError(
+            "gf2_numpy expects GF2Matrix."
+        )
+
     return np.array(
-        [int(x.n) for x in M.arr.flat],
+        [
+            int(x.n)
+            for x in M.arr.flat
+        ],
         dtype=np.uint8,
-    ).reshape(M.arr.shape)
+    ).reshape(
+        M.arr.shape
+    )
 
 
 def matrix_is_zero(M):
-    return not np.any(gf2_numpy(M))
+    """
+    Test whether a GF2Matrix is zero.
+    """
+
+    return not np.any(
+        gf2_numpy(M)
+    )
 
 
-def matrix_equal(A, B):
+def matrix_equal(
+    A,
+    B,
+):
+    """
+    Compare two GF2Matrix objects.
+    """
+
     return np.array_equal(
         gf2_numpy(A),
         gf2_numpy(B),
@@ -46,15 +99,118 @@ def matrix_equal(A, B):
 
 
 def gf2_identity(size):
+    """
+    Identity matrix over GF(2).
+    """
+
     return GF2Matrix.from_list(
-        np.eye(size, dtype=np.uint8)
+        np.eye(
+            size,
+            dtype=np.uint8,
+        )
     )
 
 
 def vector_weight(M):
+    """
+    Hamming weight of a GF2Matrix row vector.
+    """
+
+    if not isinstance(
+        M,
+        GF2Matrix,
+    ):
+        raise TypeError(
+            "vector_weight expects GF2Matrix."
+        )
+
     return sum(
         int(x.n)
         for x in M.arr.flat
+    )
+
+
+def validate_permutation(
+    P,
+    P_inv,
+    n,
+):
+    """
+    Validate a permutation vector and its inverse.
+
+    Required identities:
+
+        P[P_inv] = id,
+
+        P_inv[P] = id.
+
+    We also check the induced action on a probe vector.
+    """
+
+    P = np.asarray(
+        P,
+        dtype=np.int64,
+    ).reshape(-1)
+
+    P_inv = np.asarray(
+        P_inv,
+        dtype=np.int64,
+    ).reshape(-1)
+
+    identity = np.arange(
+        n,
+        dtype=np.int64,
+    )
+
+    shape_ok = (
+        P.shape == (n,)
+        and
+        P_inv.shape == (n,)
+    )
+
+    if not shape_ok:
+        return False
+
+    P_valid = np.array_equal(
+        np.sort(P),
+        identity,
+    )
+
+    P_inv_valid = np.array_equal(
+        np.sort(P_inv),
+        identity,
+    )
+
+    left_inverse = np.array_equal(
+        P[P_inv],
+        identity,
+    )
+
+    right_inverse = np.array_equal(
+        P_inv[P],
+        identity,
+    )
+
+    probe = np.arange(
+        n,
+        dtype=np.int64,
+    )
+
+    round_trip = np.array_equal(
+        probe[P][P_inv],
+        probe,
+    )
+
+    return (
+        P_valid
+        and
+        P_inv_valid
+        and
+        left_inverse
+        and
+        right_inverse
+        and
+        round_trip
     )
 
 
@@ -71,44 +227,75 @@ def test_parameter_set(
 ):
     print()
     print("=" * 78)
+
     print(
         f"SCALING TEST: "
         f"m={m}, n={n}, t={t}"
     )
+
     print("=" * 78)
 
-    np.random.seed(seed)
+    np.random.seed(
+        seed
+    )
 
     # ------------------------------------------------------------
-    # Theoretical dimension lower bound
+    # 1. Parameter checks
     # ------------------------------------------------------------
 
-    dimension_lower_bound = n - m * t
+    dimension_lower_bound = (
+        n - m * t
+    )
 
     print()
-    print("[1] Parameter checks")
-    print(f"  field size             = {2 ** m}")
-    print(f"  nonzero field elements = {2 ** m - 1}")
-    print(f"  code length n          = {n}")
-    print(f"  Goppa degree t         = {t}")
     print(
-        f"  dimension lower bound  = "
-        f"n - m*t = {dimension_lower_bound}"
+        "[1] Parameter checks"
+    )
+
+    print(
+        f"  field size             = "
+        f"{2 ** m}"
+    )
+
+    print(
+        f"  nonzero field elements = "
+        f"{2 ** m - 1}"
+    )
+
+    print(
+        f"  code length n          = "
+        f"{n}"
+    )
+
+    print(
+        f"  Goppa degree t         = "
+        f"{t}"
+    )
+
+    print(
+        "  dimension lower bound  = "
+        f"n - m*t = "
+        f"{dimension_lower_bound}"
     )
 
     if n > 2 ** m - 1:
         raise AssertionError(
-            "Current implementation uses only nonzero "
-            "support elements, so n must satisfy "
+            "Current Goppa backend uses the "
+            "nonzero support "
+            "{1, alpha, ..., alpha^(n-1)}, "
+            "so n must satisfy "
             "n <= 2^m - 1."
         )
 
     # ------------------------------------------------------------
-    # Key generation
+    # 2. Key generation
     # ------------------------------------------------------------
 
     print()
-    print("[2] Generating Goppa code and McEliece keys...")
+    print(
+        "[2] Generating Goppa code "
+        "and McEliece keys..."
+    )
 
     mc = McElieceCipher(
         m=m,
@@ -121,69 +308,185 @@ def test_parameter_set(
     mc.generate_random_keys()
 
     keygen_time = (
-        time.perf_counter() - start
+        time.perf_counter()
+        - start
     )
 
     k = mc.k
 
     print()
-    print("Generated parameters:")
-    print(f"  m = {m}")
-    print(f"  n = {n}")
-    print(f"  k = {k}")
-    print(f"  t = {t}")
+    print(
+        "Generated parameters:"
+    )
 
-    print()
-    print("Matrix dimensions:")
     print(
-        f"  G     = {mc.G.arr.shape}"
+        f"  m = {m}"
     )
+
     print(
-        f"  H     = {mc.H.arr.shape}"
+        f"  n = {n}"
     )
+
     print(
-        f"  S     = {mc.S.arr.shape}"
+        f"  k = {k}"
     )
+
     print(
-        f"  P     = {mc.P.arr.shape}"
-    )
-    print(
-        f"  G_pub = {mc.Gp.arr.shape}"
+        f"  t = {t}"
     )
 
     print()
     print(
-        f"Key-generation time = "
+        "Object dimensions:"
+    )
+
+    print(
+        f"  G     = "
+        f"{mc.G.arr.shape}"
+    )
+
+    print(
+        f"  H     = "
+        f"{mc.H.arr.shape}"
+    )
+
+    print(
+        f"  S     = "
+        f"{mc.S.arr.shape}"
+    )
+
+    print(
+        f"  P     = "
+        f"{mc.P.shape} "
+        f"(permutation vector)"
+    )
+
+    print(
+        f"  P_inv = "
+        f"{mc.P_inv.shape} "
+        f"(inverse permutation)"
+    )
+
+    print(
+        f"  G_pub = "
+        f"{mc.Gp.arr.shape}"
+    )
+
+    # ------------------------------------------------------------
+    # Permutation storage comparison
+    # ------------------------------------------------------------
+
+    dense_P_entries = (
+        n * n
+    )
+
+    vector_P_entries = (
+        n
+    )
+
+    print()
+    print(
+        "Permutation storage:"
+    )
+
+    print(
+        f"  dense matrix entries   = "
+        f"{dense_P_entries}"
+    )
+
+    print(
+        f"  vector entries         = "
+        f"{vector_P_entries}"
+    )
+
+    print(
+        f"  entry-count reduction  = "
+        f"{dense_P_entries / vector_P_entries:.1f}x"
+    )
+
+    print()
+    print(
+        "Key-generation time = "
         f"{keygen_time:.6f} seconds"
     )
 
     # ------------------------------------------------------------
-    # Dimension/rank checks
+    # 3. Dimension/rank checks
     # ------------------------------------------------------------
 
     print()
-    print("[3] Checking dimensions and rank...")
+    print(
+        "[3] Checking dimensions and rank..."
+    )
 
     expected_H_shape = (
         m * t,
         n,
     )
 
-    if mc.H.arr.shape != expected_H_shape:
+    if (
+        mc.H.arr.shape
+        != expected_H_shape
+    ):
         raise AssertionError(
-            f"H has shape {mc.H.arr.shape}, "
-            f"expected {expected_H_shape}."
+            f"H has shape "
+            f"{mc.H.arr.shape}, "
+            f"expected "
+            f"{expected_H_shape}."
         )
 
-    if mc.G.arr.shape != (k, n):
+    if (
+        mc.G.arr.shape
+        != (k, n)
+    ):
         raise AssertionError(
-            "Unexpected generator matrix dimensions."
+            "Unexpected generator "
+            "matrix dimensions."
         )
 
-    _, rank_H = mc.H.rref()
+    if (
+        mc.Gp.arr.shape
+        != (k, n)
+    ):
+        raise AssertionError(
+            "Unexpected public-generator "
+            "dimensions."
+        )
+
+    if (
+        mc.S.arr.shape
+        != (k, k)
+    ):
+        raise AssertionError(
+            "Unexpected scrambling-matrix "
+            "dimensions."
+        )
+
+    if (
+        mc.P.shape
+        != (n,)
+    ):
+        raise AssertionError(
+            "Unexpected permutation-vector "
+            "dimensions."
+        )
+
+    if (
+        mc.P_inv.shape
+        != (n,)
+    ):
+        raise AssertionError(
+            "Unexpected inverse-permutation "
+            "dimensions."
+        )
+
+    _, rank_H = (
+        mc.H.rref()
+    )
 
     print(
-        f"  rank(H)                = {rank_H}"
+        f"  rank(H)                = "
+        f"{rank_H}"
     )
 
     print(
@@ -192,7 +495,8 @@ def test_parameter_set(
     )
 
     print(
-        f"  actual k               = {k}"
+        f"  actual k               = "
+        f"{k}"
     )
 
     print(
@@ -200,34 +504,39 @@ def test_parameter_set(
         f"{dimension_lower_bound}"
     )
 
-    if k != n - rank_H:
+    if k != (
+        n - rank_H
+    ):
         raise AssertionError(
-            "Generator dimension does not equal "
-            "the nullity of H."
+            "Generator dimension does not "
+            "equal nullity of H."
         )
 
-    # Important:
-    #
-    # For a binary Goppa code,
+    # Binary Goppa dimension bound:
     #
     #     k >= n - m t.
     #
-    # Equality need not be assumed in the test.
+    # Equality is common for our current tests,
+    # but the regression only requires the bound.
 
     if k < dimension_lower_bound:
         raise AssertionError(
-            "Code dimension violates the standard "
-            "binary-Goppa lower bound."
+            "Code dimension violates "
+            "k >= n - mt."
         )
 
-    print("  Dimension/rank checks: PASS")
+    print(
+        "  Dimension/rank checks: PASS"
+    )
 
     # ------------------------------------------------------------
-    # Orthogonality
+    # 4. G H^T = 0
     # ------------------------------------------------------------
 
     print()
-    print("[4] Checking G H^T = 0...")
+    print(
+        "[4] Checking G H^T = 0..."
+    )
 
     GHt = (
         mc.G
@@ -239,8 +548,10 @@ def test_parameter_set(
         f"{GHt.arr.shape}"
     )
 
-    orthogonal = matrix_is_zero(
-        GHt
+    orthogonal = (
+        matrix_is_zero(
+            GHt
+        )
     )
 
     print(
@@ -254,70 +565,160 @@ def test_parameter_set(
         )
 
     # ------------------------------------------------------------
-    # Scrambling matrix
+    # 5. Scrambling inverse
     # ------------------------------------------------------------
 
     print()
-    print("[5] Checking S S^{-1} = I_k...")
+    print(
+        "[5] Checking S S^{-1} = I_k..."
+    )
 
     SSinv = (
         mc.S
         * mc.S_inv
     )
 
-    scrambling_ok = matrix_equal(
-        SSinv,
-        gf2_identity(k),
+    scrambling_ok = (
+        matrix_equal(
+            SSinv,
+            gf2_identity(k),
+        )
     )
 
     print(
-        f"  scrambling inverse : "
+        "  scrambling inverse : "
         f"{scrambling_ok}"
     )
 
     if not scrambling_ok:
         raise AssertionError(
-            "S S^{-1} != I."
+            "S S^{-1} != I_k."
         )
 
     # ------------------------------------------------------------
-    # Permutation
+    # 6. Permutation vectors
     # ------------------------------------------------------------
 
     print()
-    print("[6] Checking P P^{-1} = I_n...")
-
-    PPinv = (
-        mc.P
-        * mc.P_inv
+    print(
+        "[6] Checking permutation-vector inverse..."
     )
 
-    permutation_ok = matrix_equal(
-        PPinv,
-        gf2_identity(n),
+    identity_positions = np.arange(
+        n,
+        dtype=np.int64,
+    )
+
+    P_valid = np.array_equal(
+        np.sort(mc.P),
+        identity_positions,
+    )
+
+    P_inv_valid = np.array_equal(
+        np.sort(mc.P_inv),
+        identity_positions,
+    )
+
+    P_Pinv_ok = np.array_equal(
+        mc.P[
+            mc.P_inv
+        ],
+        identity_positions,
+    )
+
+    Pinv_P_ok = np.array_equal(
+        mc.P_inv[
+            mc.P
+        ],
+        identity_positions,
+    )
+
+    probe = np.arange(
+        n,
+        dtype=np.int64,
+    )
+
+    round_trip_ok = np.array_equal(
+        probe[
+            mc.P
+        ][
+            mc.P_inv
+        ],
+        probe,
+    )
+
+    permutation_ok = (
+        validate_permutation(
+            mc.P,
+            mc.P_inv,
+            n,
+        )
     )
 
     print(
-        f"  permutation inverse : "
+        "  P is valid permutation       : "
+        f"{P_valid}"
+    )
+
+    print(
+        "  P_inv is valid permutation   : "
+        f"{P_inv_valid}"
+    )
+
+    print(
+        "  P[P_inv] == identity         : "
+        f"{P_Pinv_ok}"
+    )
+
+    print(
+        "  P_inv[P] == identity         : "
+        f"{Pinv_P_ok}"
+    )
+
+    print(
+        "  vector round trip            : "
+        f"{round_trip_ok}"
+    )
+
+    print(
+        "  permutation-vector test      : "
         f"{permutation_ok}"
     )
 
     if not permutation_ok:
         raise AssertionError(
-            "P P^{-1} != I."
+            "Permutation-vector "
+            "inverse failed."
         )
 
     # ------------------------------------------------------------
-    # Public generator
+    # 7. Public generator
+    #
+    #       G_pub = S G P
+    #
+    # With vector P:
+    #
+    #       G_pub = (S G)[:, P].
     # ------------------------------------------------------------
 
     print()
-    print("[7] Checking G_pub = S G P...")
+    print(
+        "[7] Checking "
+        "G_pub = (S G)[:, P]..."
+    )
 
-    expected_Gp = (
+    SG = (
         mc.S
         * mc.G
-        * mc.P
+    )
+
+    expected_Gp = (
+        GF2Matrix(
+            SG.arr[
+                :,
+                mc.P
+            ]
+        )
     )
 
     public_generator_ok = (
@@ -328,23 +729,23 @@ def test_parameter_set(
     )
 
     print(
-        f"  public-generator consistency : "
+        "  public-generator consistency : "
         f"{public_generator_ok}"
     )
 
     if not public_generator_ok:
         raise AssertionError(
-            "G_pub != S G P."
+            "G_pub != (S G)[:, P]."
         )
 
     # ------------------------------------------------------------
-    # Encryption/decryption
+    # 8. Encryption/decryption trials
     # ------------------------------------------------------------
 
     print()
     print(
         f"[8] Running {trials} "
-        f"encryption/decryption trials..."
+        "encryption/decryption trials..."
     )
 
     successful_trials = 0
@@ -356,6 +757,10 @@ def test_parameter_set(
         1,
         trials + 1,
     ):
+        # --------------------------------------------------------
+        # Random plaintext
+        # --------------------------------------------------------
+
         message = np.random.randint(
             0,
             2,
@@ -363,21 +768,26 @@ def test_parameter_set(
             dtype=np.uint8,
         )
 
-        # Clean public codeword.
         message_matrix = (
             GF2Matrix.from_list(
                 message
             )
         )
 
-        clean = (
+        # --------------------------------------------------------
+        # Clean public codeword
+        #
+        #     c_clean = m G_pub.
+        # --------------------------------------------------------
+
+        clean_public = (
             message_matrix
             * mc.Gp
         )
 
-        # ----------------------------
-        # Encrypt
-        # ----------------------------
+        # --------------------------------------------------------
+        # Encryption
+        # --------------------------------------------------------
 
         start = time.perf_counter()
 
@@ -394,34 +804,55 @@ def test_parameter_set(
             encryption_time
         )
 
-        # ----------------------------
-        # Recover actual injected
-        # error vector.
+        # --------------------------------------------------------
+        # Recover injected error
         #
-        # In characteristic two:
+        #     e = c + m G_pub
         #
-        #     e = c + m G_pub.
-        # ----------------------------
+        # over GF(2).
+        # --------------------------------------------------------
 
         error = (
             ciphertext
-            + clean
+            + clean_public
         )
 
-        error_weight = vector_weight(
-            error
+        error_weight = (
+            vector_weight(
+                error
+            )
         )
 
         if error_weight != t:
             raise AssertionError(
-                f"Encryption inserted error "
+                "Encryption inserted error "
                 f"weight {error_weight}; "
-                f"expected exactly {t}."
+                f"expected {t}."
             )
 
-        # ----------------------------
+        # --------------------------------------------------------
+        # Explicitly check inverse permutation
+        # --------------------------------------------------------
+
+        secret_coordinate_ct = (
+            GF2Matrix(
+                ciphertext.arr[
+                    mc.P_inv
+                ]
+            )
+        )
+
+        if len(
+            secret_coordinate_ct
+        ) != n:
+            raise AssertionError(
+                "Inverse permutation changed "
+                "ciphertext length."
+            )
+
+        # --------------------------------------------------------
         # Decrypt
-        # ----------------------------
+        # --------------------------------------------------------
 
         start = time.perf_counter()
 
@@ -440,12 +871,12 @@ def test_parameter_set(
 
         message_int = np.asarray(
             message,
-            dtype=int,
+            dtype=np.uint8,
         ).reshape(-1)
 
         decoded_int = np.asarray(
             decoded,
-            dtype=int,
+            dtype=np.uint8,
         ).reshape(-1)
 
         success = np.array_equal(
@@ -462,91 +893,112 @@ def test_parameter_set(
         )
 
         print(
-            f"    injected error weight = "
+            "    injected error weight = "
             f"{error_weight}"
         )
 
         print(
-            f"    encryption time       = "
+            "    encryption time       = "
             f"{encryption_time:.6f} s"
         )
 
         print(
-            f"    decryption time       = "
+            "    decryption time       = "
             f"{decryption_time:.6f} s"
         )
 
         print(
-            f"    success               = "
+            "    success               = "
             f"{success}"
         )
 
         if not success:
             print(
-                f"    message = "
+                "    message = "
                 f"{message_int}"
             )
 
             print(
-                f"    decoded = "
+                "    decoded = "
                 f"{decoded_int}"
             )
 
             raise AssertionError(
-                f"Decryption failed for "
+                "Decryption failed for "
                 f"(m,n,t)=({m},{n},{t})."
             )
 
     # ------------------------------------------------------------
-    # Summary
+    # 9. Timing summary
     # ------------------------------------------------------------
 
     avg_enc = float(
-        np.mean(encryption_times)
+        np.mean(
+            encryption_times
+        )
     )
 
     avg_dec = float(
-        np.mean(decryption_times)
+        np.mean(
+            decryption_times
+        )
     )
+
+    # ------------------------------------------------------------
+    # Parameter-set result
+    # ------------------------------------------------------------
 
     print()
     print("-" * 78)
-    print("PARAMETER-SET RESULT")
+    print(
+        "PARAMETER-SET RESULT"
+    )
     print("-" * 78)
 
     print(
-        f"Parameters               : "
+        "Parameters               : "
         f"({m}, {n}, {t})"
     )
 
     print(
-        f"Dimension k              : "
+        "Dimension k              : "
         f"{k}"
     )
 
     print(
-        f"rank(H)                  : "
+        "rank(H)                  : "
         f"{rank_H}"
     )
 
     print(
-        f"Key-generation time      : "
+        "Permutation representation: "
+        f"vector length {n}"
+    )
+
+    print(
+        "Permutation reduction    : "
+        f"{n:.1f}x fewer entries"
+    )
+
+    print(
+        "Key-generation time      : "
         f"{keygen_time:.6f} s"
     )
 
     print(
-        f"Average encryption time  : "
+        "Average encryption time  : "
         f"{avg_enc:.6f} s"
     )
 
     print(
-        f"Average decryption time  : "
+        "Average decryption time  : "
         f"{avg_dec:.6f} s"
     )
 
     print(
-        f"Encryption/decryption    : "
-        f"{successful_trials}/{trials} PASS"
+        "Encryption/decryption    : "
+        f"{successful_trials}/"
+        f"{trials} PASS"
     )
 
     return {
@@ -560,6 +1012,8 @@ def test_parameter_set(
         "avg_dec": avg_dec,
         "successes": successful_trials,
         "trials": trials,
+        "permutation_entries": n,
+        "dense_permutation_entries": n * n,
     }
 
 
@@ -569,8 +1023,14 @@ def test_parameter_set(
 
 def main():
     print()
+
     print("=" * 78)
-    print("BINARY GOPPA / McELIECE SCALING REGRESSION")
+
+    print(
+        "BINARY GOPPA / McELIECE "
+        "SCALING REGRESSION — PHASE 2B"
+    )
+
     print("=" * 78)
 
     results = []
@@ -578,23 +1038,38 @@ def main():
     for index, parameters in enumerate(
         PARAMETER_SETS
     ):
-        m, n, t, trials = parameters
+        (
+            m,
+            n,
+            t,
+            trials,
+        ) = parameters
 
-        result = test_parameter_set(
-            m=m,
-            n=n,
-            t=t,
-            trials=trials,
-            seed=BASE_SEED + index,
+        result = (
+            test_parameter_set(
+                m=m,
+                n=n,
+                t=t,
+                trials=trials,
+                seed=BASE_SEED + index,
+            )
         )
 
         results.append(
             result
         )
 
+    # ------------------------------------------------------------
+    # Final report
+    # ------------------------------------------------------------
+
     print()
     print("=" * 78)
-    print("FINAL SCALING SUMMARY")
+
+    print(
+        "FINAL SCALING SUMMARY — PHASE 2B"
+    )
+
     print("=" * 78)
 
     for result in results:
@@ -608,6 +1083,9 @@ def main():
             f"  "
             f"rank(H)={result['rank_H']}"
             f"  "
+            f"P={result['permutation_entries']}"
+            f" entries"
+            f"  "
             f"keygen={result['keygen_time']:.4f}s"
             f"  "
             f"dec={result['avg_dec']:.4f}s"
@@ -618,7 +1096,30 @@ def main():
 
     print()
     print(
-        "ALL SCALING REGRESSION TESTS PASSED."
+        "Goppa construction           : PASS"
+    )
+
+    print(
+        "Permutation-vector migration : PASS"
+    )
+
+    print(
+        "Public-generator consistency : PASS"
+    )
+
+    print(
+        "Exact encryption error weight: PASS"
+    )
+
+    print(
+        "Patterson decoding           : PASS"
+    )
+
+    print()
+
+    print(
+        "ALL PHASE 2B SCALING "
+        "REGRESSION TESTS PASSED."
     )
 
 

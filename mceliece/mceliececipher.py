@@ -12,7 +12,6 @@ from mceliece.mathutils import (
     ext_euclid_poly_alt,
     get_binary_from_alpha,
     random_inv_matrix,
-    random_perm_matrix,
     rref,
 )
 
@@ -27,41 +26,85 @@ class McElieceCipher:
     Parameters
     ----------
     m : int
-        Extension degree. The Goppa code is defined using GF(2^m).
+        Extension degree.  The Goppa code is defined using GF(2^m).
 
     n : int
         Code length.
 
     t : int
-        Degree of the Goppa polynomial and number of errors
+        Degree of the Goppa polynomial and the number of errors
         injected by the baseline McEliece encryption algorithm.
 
     Notes
     -----
-    This class is currently used as the baseline implementation
-    that will later be extended for the homomorphic-encryption
-    construction.
+    The current implementation uses:
+
+        G       secret binary Goppa generator matrix
+        H       secret binary parity-check matrix
+        S       secret invertible scrambling matrix
+        P       secret permutation vector
+        P_inv   inverse permutation vector
+        Gp      public generator matrix
+
+    The public generator satisfies mathematically
+
+        G_pub = S G P.
+
+    The permutation P is represented by an integer vector instead
+    of a dense n x n permutation matrix.
+
+    For a row vector x, the action of P is
+
+        x P := x[P].
+
+    Therefore
+
+        (x P) P^{-1}
+        = x[P][P_inv]
+        = x.
+
+    This reduces permutation storage from O(n^2) entries to O(n).
     """
 
-    def __init__(self, m, n, t):
+    # ============================================================
+    # Construction
+    # ============================================================
+
+    def __init__(
+        self,
+        m,
+        n,
+        t,
+    ):
         self.m = int(m)
         self.n = int(n)
         self.t = int(t)
 
         self.q = 2
 
+        # --------------------------------------------------------
+        # Basic parameter validation
+        # --------------------------------------------------------
+
         if self.m <= 0:
-            raise ValueError("m must be positive.")
+            raise ValueError(
+                "m must be positive."
+            )
 
         if self.n <= 0:
-            raise ValueError("n must be positive.")
+            raise ValueError(
+                "n must be positive."
+            )
 
         if self.t <= 0:
-            raise ValueError("t must be positive.")
+            raise ValueError(
+                "t must be positive."
+            )
 
         if self.n > 2 ** self.m:
             raise ValueError(
-                f"n={self.n} exceeds field size 2^m={2 ** self.m}."
+                f"n={self.n} exceeds "
+                f"field size 2^m={2 ** self.m}."
             )
 
         log.info(
@@ -74,22 +117,45 @@ class McElieceCipher:
             ") initiated"
         )
 
-        # Secret Goppa-code data.
+        # --------------------------------------------------------
+        # Secret Goppa-code data
+        # --------------------------------------------------------
+
         self.G = None
         self.H = None
         self.k = None
 
-        # McEliece scrambling/permutation matrices.
+        # --------------------------------------------------------
+        # McEliece permutation
+        #
+        # Phase 2B representation:
+        #
+        #     P     : ndarray shape (n,)
+        #     P_inv : ndarray shape (n,)
+        #
+        # rather than dense n x n binary matrices.
+        # --------------------------------------------------------
+
         self.P = None
         self.P_inv = None
+
+        # --------------------------------------------------------
+        # Scrambling matrix
+        # --------------------------------------------------------
 
         self.S = None
         self.S_inv = None
 
-        # Public generator matrix.
+        # --------------------------------------------------------
+        # Public generator
+        # --------------------------------------------------------
+
         self.Gp = None
 
-        # Goppa polynomial and extension-field modulus.
+        # --------------------------------------------------------
+        # Goppa polynomial and extension-field modulus
+        # --------------------------------------------------------
+
         self.g_poly = None
         self.irr_poly = None
 
@@ -102,26 +168,190 @@ class McElieceCipher:
         """
         Convert value into GF2Matrix if necessary.
 
-        This allows the class to work both with matrices generated
-        directly in memory and matrices loaded from NumPy files.
+        This allows the class to work with both objects generated
+        directly in memory and arrays restored from serialized keys.
         """
 
-        if isinstance(value, GF2Matrix):
+        if isinstance(
+            value,
+            GF2Matrix,
+        ):
             return value
 
-        arr = np.asarray(value)
+        arr = np.asarray(
+            value
+        )
 
-        # Handle a possible zero-dimensional object array containing
-        # a GF2Matrix object.
+        # A NumPy object array can occasionally contain a single
+        # GF2Matrix object after serialization.
         if arr.ndim == 0:
             item = arr.item()
 
-            if isinstance(item, GF2Matrix):
+            if isinstance(
+                item,
+                GF2Matrix,
+            ):
                 return item
 
-            arr = np.asarray(item)
+            arr = np.asarray(
+                item
+            )
 
-        return GF2Matrix.from_list(arr)
+        return GF2Matrix.from_list(
+            arr
+        )
+
+    @staticmethod
+    def _as_permutation_vector(
+        value,
+        n,
+        name="permutation",
+    ):
+        """
+        Normalize and validate a permutation vector.
+
+        Parameters
+        ----------
+        value
+            Array-like object representing a permutation.
+
+        n : int
+            Required permutation length.
+
+        name : str
+            Name used in error messages.
+
+        Returns
+        -------
+        numpy.ndarray
+            Integer array of shape (n,).
+
+        A valid permutation must contain each integer
+
+            0, 1, ..., n-1
+
+        exactly once.
+        """
+
+        arr = np.asarray(
+            value,
+            dtype=np.int64,
+        ).reshape(-1)
+
+        if arr.shape != (n,):
+            raise ValueError(
+                f"{name} must have shape ({n},), "
+                f"received {arr.shape}."
+            )
+
+        expected = np.arange(
+            n,
+            dtype=np.int64,
+        )
+
+        if not np.array_equal(
+            np.sort(arr),
+            expected,
+        ):
+            raise ValueError(
+                f"{name} is not a valid "
+                f"permutation of 0,...,{n - 1}."
+            )
+
+        return arr
+
+    # ============================================================
+    # Permutation helpers
+    # ============================================================
+
+    @staticmethod
+    def _permute_vector(
+        vector,
+        permutation,
+    ):
+        """
+        Apply a permutation to a GF2 row vector.
+
+        If
+
+            y = x[P],
+
+        this method returns y.
+        """
+
+        vector = McElieceCipher._as_gf2_matrix(
+            vector
+        )
+
+        permutation = np.asarray(
+            permutation,
+            dtype=np.int64,
+        ).reshape(-1)
+
+        if vector.arr.ndim != 1:
+            raise ValueError(
+                "_permute_vector expects "
+                "a one-dimensional GF2 vector."
+            )
+
+        if len(vector) != len(permutation):
+            raise ValueError(
+                "Vector and permutation lengths "
+                "do not agree."
+            )
+
+        return GF2Matrix(
+            vector.arr[
+                permutation
+            ]
+        )
+
+    @staticmethod
+    def _permute_columns(
+        matrix,
+        permutation,
+    ):
+        """
+        Apply a right-hand permutation to matrix columns.
+
+        If A is k x n, mathematically this implements
+
+            A P
+
+        using
+
+            A[:, P].
+        """
+
+        matrix = McElieceCipher._as_gf2_matrix(
+            matrix
+        )
+
+        permutation = np.asarray(
+            permutation,
+            dtype=np.int64,
+        ).reshape(-1)
+
+        if matrix.arr.ndim != 2:
+            raise ValueError(
+                "_permute_columns expects "
+                "a two-dimensional matrix."
+            )
+
+        if matrix.arr.shape[1] != len(
+            permutation
+        ):
+            raise ValueError(
+                "Matrix column count and "
+                "permutation length do not agree."
+            )
+
+        return GF2Matrix(
+            matrix.arr[
+                :,
+                permutation
+            ]
+        )
 
     # ============================================================
     # Key generation
@@ -129,20 +359,27 @@ class McElieceCipher:
 
     def generate_random_keys(self):
         """
-        Generate a binary Goppa code and the McEliece key pair.
+        Generate a binary Goppa code and McEliece key pair.
 
-        Produces
+        The secret objects are
 
-            G       secret generator matrix
-            H       parity-check matrix
-            S       invertible scrambling matrix
-            P       permutation matrix
-            Gp      public generator S G P
+            G,
+            H,
+            S,
+            S^{-1},
+            P,
+            P^{-1}.
 
-        satisfying
+        The public generator is
 
-            G H^T = 0.
+            G_pub = S G P.
+
+        In Phase 2B, P is represented by a permutation vector.
         """
+
+        # --------------------------------------------------------
+        # 1. Generate binary Goppa code
+        # --------------------------------------------------------
 
         (
             self.G,
@@ -156,19 +393,20 @@ class McElieceCipher:
         ).gen()
 
         # --------------------------------------------------------
-        # Store the Goppa polynomial coefficients.
+        # 2. Store Goppa polynomial coefficients
         #
-        # Every coefficient lies in GF(2^m).  We store it as its
-        # m-bit coefficient vector with respect to the basis
+        # Every coefficient lies in GF(2^m).  Store each
+        # coefficient as its m-bit basis representation:
         #
         #     1, alpha, ..., alpha^(m-1).
-        #
-        # This avoids the old SymPy ZZ/GF(2) domain conflict.
         # --------------------------------------------------------
 
         g_coeffs = []
 
-        for coefficient in self.g_poly.all_coeffs()[::-1]:
+        for coefficient in (
+            self.g_poly
+            .all_coeffs()[::-1]
+        ):
             bits = get_binary_from_alpha(
                 coefficient,
                 self.irr_poly,
@@ -188,57 +426,147 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # Store the irreducible extension-field polynomial in
-        # ascending coefficient order.
+        # 3. Store irreducible extension-field polynomial
+        #
+        # Coefficients are stored in ascending order.
         # --------------------------------------------------------
 
         self.irr_poly = np.array(
             [
                 int(c) % 2
-                for c in self.irr_poly.all_coeffs()[::-1]
+                for c
+                in self.irr_poly
+                .all_coeffs()[::-1]
             ],
             dtype=np.uint8,
         )
 
-        # Actual code dimension determined by the null space.
-        self.k = self.G.arr.shape[0]
+        # --------------------------------------------------------
+        # 4. Actual binary code dimension
+        # --------------------------------------------------------
+
+        self.k = (
+            self.G.arr.shape[0]
+        )
 
         log.info(
-            f"Generated binary Goppa code "
+            "Generated binary Goppa code "
             f"[n={self.n}, k={self.k}]"
         )
 
         # --------------------------------------------------------
-        # Generate McEliece permutation matrix.
+        # 5. Generate secret permutation
+        #
+        # P is a vector containing each coordinate exactly once.
         # --------------------------------------------------------
 
-        self.P = GF2Matrix.from_list(
-            random_perm_matrix(self.n)
+        self.P = np.random.permutation(
+            self.n
+        ).astype(
+            np.int64
         )
 
-        self.P_inv = self.P.inv()
+        self.P_inv = np.argsort(
+            self.P
+        ).astype(
+            np.int64
+        )
 
         # --------------------------------------------------------
-        # Generate random invertible scrambling matrix.
+        # 6. Validate permutation and inverse
+        # --------------------------------------------------------
+
+        identity_positions = np.arange(
+            self.n,
+            dtype=np.int64,
+        )
+
+        if not np.array_equal(
+            np.sort(self.P),
+            identity_positions,
+        ):
+            raise RuntimeError(
+                "Generated P is not a valid permutation."
+            )
+
+        if not np.array_equal(
+            np.sort(self.P_inv),
+            identity_positions,
+        ):
+            raise RuntimeError(
+                "Generated P_inv is not a valid permutation."
+            )
+
+        if not np.array_equal(
+            self.P[
+                self.P_inv
+            ],
+            identity_positions,
+        ):
+            raise RuntimeError(
+                "Invalid permutation inverse: "
+                "P[P_inv] != identity."
+            )
+
+        if not np.array_equal(
+            self.P_inv[
+                self.P
+            ],
+            identity_positions,
+        ):
+            raise RuntimeError(
+                "Invalid permutation inverse: "
+                "P_inv[P] != identity."
+            )
+
+        # --------------------------------------------------------
+        # 7. Generate secret scrambling matrix
         # --------------------------------------------------------
 
         self.S = GF2Matrix.from_list(
-            random_inv_matrix(self.k)
+            random_inv_matrix(
+                self.k
+            )
         )
 
-        self.S_inv = self.S.inv()
+        self.S_inv = (
+            self.S.inv()
+        )
 
         # --------------------------------------------------------
-        # Public generator
+        # 8. Construct public generator
         #
-        #             G_pub = S G P.
+        # Mathematically:
+        #
+        #     G_pub = S G P.
+        #
+        # Compute SG first, then apply P as a column permutation.
         # --------------------------------------------------------
 
-        self.Gp = (
+        SG = (
             self.S
             * self.G
-            * self.P
         )
+
+        self.Gp = (
+            self._permute_columns(
+                SG,
+                self.P,
+            )
+        )
+
+        # --------------------------------------------------------
+        # 9. Sanity checks
+        # --------------------------------------------------------
+
+        if self.Gp.arr.shape != (
+            self.k,
+            self.n,
+        ):
+            raise RuntimeError(
+                "Public generator has unexpected "
+                f"shape {self.Gp.arr.shape}."
+            )
 
         log.info(
             "McEliece key generation completed."
@@ -248,7 +576,10 @@ class McElieceCipher:
     # Encryption
     # ============================================================
 
-    def encrypt(self, msg_arr):
+    def encrypt(
+        self,
+        msg_arr,
+    ):
         """
         Encrypt a k-bit message using the public generator matrix.
 
@@ -256,12 +587,15 @@ class McElieceCipher:
 
             c = m G_pub + e,
 
-        where e has Hamming weight exactly t.
+        where
+
+            wt(e) = t.
         """
 
         if self.Gp is None:
             raise RuntimeError(
-                "Public key has not been generated or loaded."
+                "Public key has not been "
+                "generated or loaded."
             )
 
         Gp = self._as_gf2_matrix(
@@ -278,7 +612,7 @@ class McElieceCipher:
 
         if len(msg_arr) != k:
             raise ValueError(
-                f"Wrong message length. "
+                "Wrong message length. "
                 f"Expected {k} bits, "
                 f"received {len(msg_arr)}."
             )
@@ -297,7 +631,12 @@ class McElieceCipher:
             msg_arr
         )
 
-        # Clean public codeword.
+        # --------------------------------------------------------
+        # Clean public codeword
+        #
+        #     c_0 = m G_pub.
+        # --------------------------------------------------------
+
         ciphertext = (
             message
             * Gp
@@ -307,7 +646,10 @@ class McElieceCipher:
             f"clean ciphertext = {ciphertext}"
         )
 
-        # Select exactly t distinct error positions.
+        # --------------------------------------------------------
+        # Sample exactly t distinct error coordinates
+        # --------------------------------------------------------
+
         bits_to_flip = np.random.choice(
             n,
             size=self.t,
@@ -315,13 +657,18 @@ class McElieceCipher:
         )
 
         log.debug(
-            f"error positions = {bits_to_flip}"
+            "error positions = "
+            f"{bits_to_flip}"
         )
 
-        for position in bits_to_flip:
-            ciphertext[position] = (
-                ciphertext[position].flip()
-            )
+        for position in (
+            bits_to_flip
+        ):
+            ciphertext[
+                position
+            ] = ciphertext[
+                position
+            ].flip()
 
         log.debug(
             f"noisy ciphertext = {ciphertext}"
@@ -341,10 +688,22 @@ class McElieceCipher:
         """
         Repair errors using the Patterson-style decoder from the
         original implementation.
+
+        The current Goppa support is
+
+            L_i = alpha^i,
+
+        for
+
+            i = 0,...,n-1.
+
+        Consequently the locator polynomial is evaluated at
+
+            1, alpha, alpha^2, ...
         """
 
         # --------------------------------------------------------
-        # Reconstruct the binary extension-field modulus.
+        # 1. Reconstruct binary extension-field modulus
         # --------------------------------------------------------
 
         if not isinstance(
@@ -366,7 +725,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # Reconstruct the Goppa polynomial over GF(2^m).
+        # 2. Reconstruct Goppa polynomial over GF(2^m)
         # --------------------------------------------------------
 
         if not isinstance(
@@ -375,12 +734,15 @@ class McElieceCipher:
         ):
             coefficients = []
 
-            for coefficient in self.g_poly:
+            for coefficient in (
+                self.g_poly
+            ):
                 coefficient_poly = (
                     GF2Poly.from_list(
                         [
                             int(e)
-                            for e in coefficient
+                            for e
+                            in coefficient
                         ]
                     )
                 )
@@ -407,8 +769,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # Convert the binary syndrome into a polynomial over
-        # GF(2^m).
+        # 3. Convert binary syndrome to polynomial over GF(2^m)
         # --------------------------------------------------------
 
         syndrome_matrix = (
@@ -418,7 +779,9 @@ class McElieceCipher:
         )
 
         syndrome_flat = list(
-            syndrome_matrix.arr.flat
+            syndrome_matrix
+            .arr
+            .flat
         )
 
         syndrome_coefficients = []
@@ -440,7 +803,8 @@ class McElieceCipher:
                 GF2Poly.from_list(
                     [
                         int(e)
-                        for e in block
+                        for e
+                        in block
                     ]
                 )
             )
@@ -452,8 +816,10 @@ class McElieceCipher:
                 )
             )
 
-        S_poly = GF2mPoly.from_list(
-            syndrome_coefficients
+        S_poly = (
+            GF2mPoly.from_list(
+                syndrome_coefficients
+            )
         )
 
         log.debug(
@@ -461,7 +827,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # Patterson decoding.
+        # 4. Patterson decoding
         # --------------------------------------------------------
 
         S_inv_poly = (
@@ -479,21 +845,31 @@ class McElieceCipher:
             f"{(S_poly * S_inv_poly) % self.g_poly}"
         )
 
-        # Special low-degree case.
+        # --------------------------------------------------------
+        # Special low-degree case
+        # --------------------------------------------------------
+
         if (
             S_inv_poly.degree() == 1
             and
-            S_inv_poly[1].n.degree() == 0
+            S_inv_poly[1]
+            .n
+            .degree() == 0
             and
             S_inv_poly[1]
             .n
             .poly
             .coeffs()[0] == 1
         ):
-            tau_poly = S_inv_poly
+            tau_poly = (
+                S_inv_poly
+            )
 
         else:
-            # Split g into even/odd components.
+            # ----------------------------------------------------
+            # Split g into even/odd components
+            # ----------------------------------------------------
+
             g0, g1 = (
                 self.g_poly.split()
             )
@@ -530,18 +906,25 @@ class McElieceCipher:
                 f"w = {w}"
             )
 
+            # ----------------------------------------------------
             # H(z) = S^{-1}(z) + z
+            # ----------------------------------------------------
+
             H_poly = (
                 S_inv_poly
                 +
                 GF2mPoly.from_list(
                     [
                         GF2m(
-                            GF2Poly.from_list([0]),
+                            GF2Poly.from_list(
+                                [0]
+                            ),
                             ring,
                         ),
                         GF2m(
-                            GF2Poly.from_list([1]),
+                            GF2Poly.from_list(
+                                [1]
+                            ),
                             ring,
                         ),
                     ]
@@ -609,20 +992,30 @@ class McElieceCipher:
                 f"{GF2mPoly.x(ring) * b ** 2}"
             )
 
+            # ----------------------------------------------------
+            # Error-locator polynomial
+            # ----------------------------------------------------
+
             tau_poly = (
                 a ** 2
                 +
-                GF2mPoly.x(ring)
+                GF2mPoly.x(
+                    ring
+                )
                 * b ** 2
             )
 
         log.debug(
-            f"error locator tau = {tau_poly}"
+            "error locator tau = "
+            f"{tau_poly}"
         )
 
         # --------------------------------------------------------
-        # Evaluate the locator polynomial at all support elements.
-        # A zero identifies an error coordinate.
+        # 5. Evaluate locator polynomial on support
+        #
+        # Current support:
+        #
+        #     1, alpha, alpha^2, ...
         # --------------------------------------------------------
 
         test_elem = ring.one()
@@ -630,8 +1023,10 @@ class McElieceCipher:
         for i in range(
             len(msg_arr)
         ):
-            value = tau_poly.eval(
-                test_elem
+            value = (
+                tau_poly.eval(
+                    test_elem
+                )
             )
 
             log.debug(
@@ -639,9 +1034,11 @@ class McElieceCipher:
             )
 
             if value == 0:
-                msg_arr[i] = (
-                    msg_arr[i].flip()
-                )
+                msg_arr[
+                    i
+                ] = msg_arr[
+                    i
+                ].flip()
 
                 log.info(
                     "REPAIRED ERROR "
@@ -659,23 +1056,40 @@ class McElieceCipher:
     # Goppa decoding
     # ============================================================
 
-    def decode(self, msg_arr):
+    def decode(
+        self,
+        msg_arr,
+    ):
         """
         Decode a secret-coordinate noisy Goppa codeword.
 
-        The decoder first computes the syndrome.  If the syndrome is
-        nonzero, Patterson error correction is applied.  The message
-        coefficients are then recovered from the corrected codeword.
+        The decoder computes
+
+            s = c H^T.
+
+        If s != 0, Patterson error correction is applied.
+
+        The corrected codeword then satisfies
+
+            c_clean = a G,
+
+        and a is recovered by solving the corresponding binary
+        linear system.
+
+        The RREF message-recovery step will be replaced by a
+        precomputed right inverse in Phase 2C.
         """
 
         if self.G is None:
             raise RuntimeError(
-                "Secret generator matrix G is unavailable."
+                "Secret generator matrix G "
+                "is unavailable."
             )
 
         if self.H is None:
             raise RuntimeError(
-                "Parity-check matrix H is unavailable."
+                "Parity-check matrix H "
+                "is unavailable."
             )
 
         G = self._as_gf2_matrix(
@@ -686,18 +1100,30 @@ class McElieceCipher:
             self.H
         )
 
-        msg_arr = self._as_gf2_matrix(
-            msg_arr
+        msg_arr = (
+            self._as_gf2_matrix(
+                msg_arr
+            )
         )
 
+        n = G.arr.shape[1]
+        k = G.arr.shape[0]
+
+        if len(msg_arr) != n:
+            raise ValueError(
+                "Received-word length does "
+                "not match the Goppa code length."
+            )
+
         log.debug(
-            f"received word length = {len(msg_arr)}"
+            "received word length = "
+            f"{len(msg_arr)}"
         )
 
         # --------------------------------------------------------
-        # Syndrome
+        # 1. Syndrome
         #
-        #          s = c H^T.
+        #     s = c H^T
         # --------------------------------------------------------
 
         syndrome = (
@@ -711,16 +1137,26 @@ class McElieceCipher:
 
         syndrome_is_zero = all(
             int(x.n) == 0
-            for x in syndrome.arr.flat
+            for x
+            in syndrome.arr.flat
         )
 
+        # --------------------------------------------------------
+        # 2. Patterson correction
+        # --------------------------------------------------------
+
         if not syndrome_is_zero:
-            msg_arr = self.repair_errors(
-                msg_arr,
-                syndrome,
+            msg_arr = (
+                self.repair_errors(
+                    msg_arr,
+                    syndrome,
+                )
             )
 
-            # Optional diagnostic check after repair.
+            # ----------------------------------------------------
+            # Verify repaired word is in the code
+            # ----------------------------------------------------
+
             repaired_syndrome = (
                 msg_arr
                 * H.T()
@@ -729,7 +1165,9 @@ class McElieceCipher:
             repaired_is_zero = all(
                 int(x.n) == 0
                 for x
-                in repaired_syndrome.arr.flat
+                in repaired_syndrome
+                .arr
+                .flat
             )
 
             if not repaired_is_zero:
@@ -739,27 +1177,17 @@ class McElieceCipher:
                 )
 
         # --------------------------------------------------------
-        # Recover m from
+        # 3. Recover a from
         #
-        #                m G = c.
+        #     a G = c_clean.
         #
-        # We solve the linear system by row reducing
+        # Solve by RREF of
         #
-        #              (G^T | c^T).
+        #     (G^T | c_clean^T).
         #
-        # This is suitable for the baseline implementation.
-        # Later we will systematicize G so that this RREF step
-        # can be removed.
+        # This remains the principal decoding scalability
+        # bottleneck and will be removed in Phase 2C.
         # --------------------------------------------------------
-
-        k = G.arr.shape[0]
-        n = G.arr.shape[1]
-
-        if len(msg_arr) != n:
-            raise ValueError(
-                "Decoded-word length does not "
-                "match generator matrix."
-            )
 
         augmented_numpy = np.append(
             G.arr.T,
@@ -791,10 +1219,13 @@ class McElieceCipher:
             f"{reduced}"
         )
 
-        message_column = reduced[
-            :k,
-            k:
-        ].flatten()
+        message_column = (
+            reduced[
+                :k,
+                k:
+            ]
+            .flatten()
+        )
 
         return GF2Matrix.from_list(
             message_column
@@ -804,79 +1235,126 @@ class McElieceCipher:
     # Decryption
     # ============================================================
 
-    def decrypt(self, msg_arr):
+    def decrypt(
+        self,
+        msg_arr,
+    ):
         """
         Decrypt a McEliece ciphertext.
 
-        For
+        Encryption has the form
 
-            c = m S G P + e,
+            c_pub
+                = m S G P + e_pub.
 
-        first compute
+        With the vector-permutation convention
 
-            c P^{-1},
+            x P = x[P],
 
-        decode the Goppa codeword, and finally multiply by S^{-1}.
+        undoing the permutation gives
+
+            c_sec
+                = c_pub[P_inv]
+                = m S G + e_sec.
+
+        Patterson decoding recovers
+
+            m S,
+
+        after which multiplication by S^{-1} gives m.
         """
 
         if self.H is None:
             raise RuntimeError(
-                "Private parity-check matrix H is unavailable."
+                "Private parity-check matrix H "
+                "is unavailable."
             )
 
         if self.P_inv is None:
             raise RuntimeError(
-                "Private inverse permutation P_inv is unavailable."
+                "Private inverse permutation "
+                "P_inv is unavailable."
             )
 
         if self.S_inv is None:
             raise RuntimeError(
-                "Private inverse scrambling matrix S_inv is unavailable."
+                "Private inverse scrambling "
+                "matrix S_inv is unavailable."
             )
 
         H = self._as_gf2_matrix(
             self.H
         )
 
-        P_inv = self._as_gf2_matrix(
-            self.P_inv
-        )
-
         S_inv = self._as_gf2_matrix(
             self.S_inv
         )
 
-        ciphertext = self._as_gf2_matrix(
-            msg_arr
+        ciphertext = (
+            self._as_gf2_matrix(
+                msg_arr
+            )
         )
 
         n = H.arr.shape[1]
 
         if len(ciphertext) != n:
             raise ValueError(
-                f"Wrong ciphertext length. "
+                "Wrong ciphertext length. "
                 f"Expected {n} bits, "
                 f"received {len(ciphertext)}."
             )
+
+        # --------------------------------------------------------
+        # Normalize inverse permutation
+        # --------------------------------------------------------
+
+        P_inv = (
+            self._as_permutation_vector(
+                self.P_inv,
+                n,
+                name="P_inv",
+            )
+        )
 
         log.debug(
             f"ciphertext = {ciphertext}"
         )
 
-        # Undo the secret permutation.
+        # --------------------------------------------------------
+        # 1. Undo secret permutation
+        #
+        # If
+        #
+        #     y = x[P],
+        #
+        # then
+        #
+        #     x = y[P_inv].
+        # --------------------------------------------------------
+
         secret_coordinate_word = (
-            ciphertext
-            * P_inv
+            self._permute_vector(
+                ciphertext,
+                P_inv,
+            )
         )
 
         log.debug(
-            "after P^{-1} = "
+            "after inverse permutation = "
             f"{secret_coordinate_word}"
         )
 
-        # Decode to obtain mS.
-        scrambled_message = self.decode(
-            secret_coordinate_word
+        # --------------------------------------------------------
+        # 2. Patterson decode
+        #
+        # This produces the scrambled message mS.
+        # --------------------------------------------------------
+
+        scrambled_message = (
+            self.decode(
+                secret_coordinate_word
+            )
         )
 
         log.debug(
@@ -884,7 +1362,12 @@ class McElieceCipher:
             f"{scrambled_message}"
         )
 
-        # Undo scrambling.
+        # --------------------------------------------------------
+        # 3. Undo scrambling
+        #
+        #     m = (mS) S^{-1}.
+        # --------------------------------------------------------
+
         message = (
             scrambled_message
             * S_inv
