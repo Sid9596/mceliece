@@ -12,7 +12,6 @@ from mceliece.mathutils import (
     ext_euclid_poly_alt,
     get_binary_from_alpha,
     random_inv_matrix,
-    rref,
 )
 
 
@@ -26,7 +25,7 @@ class McElieceCipher:
     Parameters
     ----------
     m : int
-        Extension degree.  The Goppa code is defined using GF(2^m).
+        Extension degree. The Goppa code is defined using GF(2^m).
 
     n : int
         Code length.
@@ -37,23 +36,29 @@ class McElieceCipher:
 
     Notes
     -----
-    The current implementation uses:
+    The implementation uses
 
         G       secret binary Goppa generator matrix
         H       secret binary parity-check matrix
+        R       right inverse of G
         S       secret invertible scrambling matrix
+        S_inv   inverse scrambling matrix
         P       secret permutation vector
         P_inv   inverse permutation vector
         Gp      public generator matrix
 
-    The public generator satisfies mathematically
+    satisfying
 
-        G_pub = S G P.
+        G H^T = 0,
 
-    The permutation P is represented by an integer vector instead
-    of a dense n x n permutation matrix.
+        G R = I_k,
 
-    For a row vector x, the action of P is
+        Gp = S G P.
+
+    Phase 2B represents the coordinate permutation using integer
+    permutation vectors instead of dense n x n permutation matrices.
+
+    For a row vector x,
 
         x P := x[P].
 
@@ -63,7 +68,24 @@ class McElieceCipher:
         = x[P][P_inv]
         = x.
 
-    This reduces permutation storage from O(n^2) entries to O(n).
+    Phase 2C introduces a precomputed right inverse
+
+        R in GF(2)^{n x k}
+
+    satisfying
+
+        G R = I_k.
+
+    After Patterson decoding produces a clean codeword
+
+        c_clean = a G,
+
+    the information vector is recovered directly as
+
+        a = c_clean R.
+
+    Hence normal decoding does not solve a new linear system for every
+    ciphertext.
     """
 
     # ============================================================
@@ -83,7 +105,7 @@ class McElieceCipher:
         self.q = 2
 
         # --------------------------------------------------------
-        # Basic parameter validation
+        # Parameter validation
         # --------------------------------------------------------
 
         if self.m <= 0:
@@ -126,14 +148,26 @@ class McElieceCipher:
         self.k = None
 
         # --------------------------------------------------------
+        # Phase 2C right inverse
+        #
+        #     G R = I_k.
+        #
+        # R has shape n x k.
+        # --------------------------------------------------------
+
+        self.R = None
+
+        # Indices of the k independent columns of G used to
+        # construct R.
+        self.right_inverse_pivots = None
+
+        # --------------------------------------------------------
         # McEliece permutation
         #
         # Phase 2B representation:
         #
         #     P     : ndarray shape (n,)
         #     P_inv : ndarray shape (n,)
-        #
-        # rather than dense n x n binary matrices.
         # --------------------------------------------------------
 
         self.P = None
@@ -168,8 +202,9 @@ class McElieceCipher:
         """
         Convert value into GF2Matrix if necessary.
 
-        This allows the class to work with both objects generated
-        directly in memory and arrays restored from serialized keys.
+        This allows the class to work with objects generated directly
+        in memory and primitive NumPy arrays restored from serialized
+        keys.
         """
 
         if isinstance(
@@ -182,8 +217,8 @@ class McElieceCipher:
             value
         )
 
-        # A NumPy object array can occasionally contain a single
-        # GF2Matrix object after serialization.
+        # A NumPy object array may contain a single GF2Matrix object
+        # when reading legacy serialized data.
         if arr.ndim == 0:
             item = arr.item()
 
@@ -210,23 +245,7 @@ class McElieceCipher:
         """
         Normalize and validate a permutation vector.
 
-        Parameters
-        ----------
-        value
-            Array-like object representing a permutation.
-
-        n : int
-            Required permutation length.
-
-        name : str
-            Name used in error messages.
-
-        Returns
-        -------
-        numpy.ndarray
-            Integer array of shape (n,).
-
-        A valid permutation must contain each integer
+        A valid permutation contains every integer
 
             0, 1, ..., n-1
 
@@ -238,7 +257,9 @@ class McElieceCipher:
             dtype=np.int64,
         ).reshape(-1)
 
-        if arr.shape != (n,):
+        if arr.shape != (
+            n,
+        ):
             raise ValueError(
                 f"{name} must have shape ({n},), "
                 f"received {arr.shape}."
@@ -260,6 +281,34 @@ class McElieceCipher:
 
         return arr
 
+    @staticmethod
+    def _gf2_matrix_equal(
+        A,
+        B,
+    ):
+        """
+        Compare two GF2Matrix objects entry by entry.
+        """
+
+        A = McElieceCipher._as_gf2_matrix(
+            A
+        )
+
+        B = McElieceCipher._as_gf2_matrix(
+            B
+        )
+
+        if A.arr.shape != B.arr.shape:
+            return False
+
+        return all(
+            int(a.n) == int(b.n)
+            for a, b in zip(
+                A.arr.flat,
+                B.arr.flat,
+            )
+        )
+
     # ============================================================
     # Permutation helpers
     # ============================================================
@@ -270,7 +319,7 @@ class McElieceCipher:
         permutation,
     ):
         """
-        Apply a permutation to a GF2 row vector.
+        Apply a permutation to a GF(2) row vector.
 
         If
 
@@ -279,8 +328,10 @@ class McElieceCipher:
         this method returns y.
         """
 
-        vector = McElieceCipher._as_gf2_matrix(
-            vector
+        vector = (
+            McElieceCipher._as_gf2_matrix(
+                vector
+            )
         )
 
         permutation = np.asarray(
@@ -294,7 +345,9 @@ class McElieceCipher:
                 "a one-dimensional GF2 vector."
             )
 
-        if len(vector) != len(permutation):
+        if len(vector) != len(
+            permutation
+        ):
             raise ValueError(
                 "Vector and permutation lengths "
                 "do not agree."
@@ -312,19 +365,21 @@ class McElieceCipher:
         permutation,
     ):
         """
-        Apply a right-hand permutation to matrix columns.
+        Apply a right-hand coordinate permutation to matrix columns.
 
-        If A is k x n, mathematically this implements
+        For A in GF(2)^{k x n}, this implements
 
             A P
 
-        using
+        as
 
             A[:, P].
         """
 
-        matrix = McElieceCipher._as_gf2_matrix(
-            matrix
+        matrix = (
+            McElieceCipher._as_gf2_matrix(
+                matrix
+            )
         )
 
         permutation = np.asarray(
@@ -354,6 +409,303 @@ class McElieceCipher:
         )
 
     # ============================================================
+    # Phase 2C right-inverse construction
+    # ============================================================
+
+    def _construct_right_inverse(self):
+        """
+        Construct a right inverse R of the generator matrix G.
+
+        Let
+
+            G in GF(2)^{k x n}
+
+        have full row rank k.
+
+        Select k independent columns with indices
+
+            J = (j_1, ..., j_k)
+
+        and define
+
+            B = G[:, J].
+
+        Since B is invertible, define
+
+            R[J, :] = B^{-1}
+
+        and set every other row of R equal to zero.
+
+        Consequently
+
+            G R
+              = G[:, J] B^{-1}
+              = B B^{-1}
+              = I_k.
+
+        Returns
+        -------
+        R : GF2Matrix
+            Right inverse with shape (n, k).
+
+        pivots : numpy.ndarray
+            Integer vector containing the k selected independent
+            column indices.
+        """
+
+        if self.G is None:
+            raise RuntimeError(
+                "Generator matrix G is unavailable."
+            )
+
+        G = self._as_gf2_matrix(
+            self.G
+        )
+
+        if G.arr.ndim != 2:
+            raise ValueError(
+                "Generator matrix G must be "
+                "two-dimensional."
+            )
+
+        k, n = G.arr.shape
+
+        if k <= 0:
+            raise ValueError(
+                "Generator matrix must have "
+                "positive row dimension."
+            )
+
+        if n <= 0:
+            raise ValueError(
+                "Generator matrix must have "
+                "positive column dimension."
+            )
+
+        if k > n:
+            raise ValueError(
+                "Generator matrix cannot have more "
+                "rows than columns."
+            )
+
+        # --------------------------------------------------------
+        # 1. Compute RREF of G once.
+        #
+        # Row operations preserve column dependence relations.
+        # Since rank(G)=k, exactly k pivot columns exist.
+        # --------------------------------------------------------
+
+        G_rref, rank = (
+            G.rref()
+        )
+
+        if rank != k:
+            raise RuntimeError(
+                f"Generator matrix has rank {rank}; "
+                f"expected full row rank {k}."
+            )
+
+        # --------------------------------------------------------
+        # 2. Extract pivot-column positions.
+        # --------------------------------------------------------
+
+        pivots = []
+
+        for row_index in range(
+            k
+        ):
+            pivot = None
+
+            for column_index in range(
+                n
+            ):
+                value = int(
+                    G_rref.arr[
+                        row_index,
+                        column_index,
+                    ].n
+                )
+
+                if value == 1:
+                    pivot = column_index
+                    break
+
+            if pivot is None:
+                raise RuntimeError(
+                    "Unable to identify a pivot "
+                    f"for RREF row {row_index}."
+                )
+
+            pivots.append(
+                pivot
+            )
+
+        pivots = np.asarray(
+            pivots,
+            dtype=np.int64,
+        )
+
+        if pivots.shape != (
+            k,
+        ):
+            raise RuntimeError(
+                "Unexpected pivot-vector shape."
+            )
+
+        if len(
+            np.unique(
+                pivots
+            )
+        ) != k:
+            raise RuntimeError(
+                "Pivot-column extraction produced "
+                "duplicate indices."
+            )
+
+        if (
+            np.any(
+                pivots < 0
+            )
+            or
+            np.any(
+                pivots >= n
+            )
+        ):
+            raise RuntimeError(
+                "Pivot-column extraction produced "
+                "an out-of-range index."
+            )
+
+        # --------------------------------------------------------
+        # 3. Form
+        #
+        #     B = G[:, J].
+        # --------------------------------------------------------
+
+        B = GF2Matrix(
+            G.arr[
+                :,
+                pivots
+            ]
+        )
+
+        if B.arr.shape != (
+            k,
+            k,
+        ):
+            raise RuntimeError(
+                f"Pivot submatrix has shape "
+                f"{B.arr.shape}; "
+                f"expected ({k}, {k})."
+            )
+
+        _, B_rank = (
+            B.rref()
+        )
+
+        if B_rank != k:
+            raise RuntimeError(
+                "Selected pivot submatrix is "
+                "not invertible over GF(2)."
+            )
+
+        # --------------------------------------------------------
+        # 4. Exact inverse over GF(2)
+        # --------------------------------------------------------
+
+        B_inv = (
+            B.inv()
+        )
+
+        if B_inv.arr.shape != (
+            k,
+            k,
+        ):
+            raise RuntimeError(
+                "Inverse pivot submatrix has "
+                "unexpected dimensions."
+            )
+
+        # --------------------------------------------------------
+        # 5. Construct R
+        #
+        #     R[J, :] = B^{-1}.
+        # --------------------------------------------------------
+
+        B_inv_numpy = np.array(
+            [
+                int(entry.n)
+                for entry in B_inv.arr.flat
+            ],
+            dtype=np.uint8,
+        ).reshape(
+            k,
+            k,
+        )
+
+        R_numpy = np.zeros(
+            (
+                n,
+                k,
+            ),
+            dtype=np.uint8,
+        )
+
+        R_numpy[
+            pivots,
+            :
+        ] = B_inv_numpy
+
+        R = GF2Matrix.from_list(
+            R_numpy
+        )
+
+        if R.arr.shape != (
+            n,
+            k,
+        ):
+            raise RuntimeError(
+                f"Right inverse has shape "
+                f"{R.arr.shape}; "
+                f"expected ({n}, {k})."
+            )
+
+        # --------------------------------------------------------
+        # 6. Verify G R = I_k once during construction.
+        # --------------------------------------------------------
+
+        GR = (
+            G
+            * R
+        )
+
+        identity = GF2Matrix.from_list(
+            np.eye(
+                k,
+                dtype=np.uint8,
+            )
+        )
+
+        if not self._gf2_matrix_equal(
+            GR,
+            identity,
+        ):
+            raise RuntimeError(
+                "Right-inverse construction failed: "
+                "G R != I_k."
+            )
+
+        log.info(
+            "Constructed generator right inverse "
+            f"R with shape {R.arr.shape}."
+        )
+
+        return (
+            R,
+            pivots,
+        )
+
+    # ============================================================
     # Key generation
     # ============================================================
 
@@ -361,20 +713,17 @@ class McElieceCipher:
         """
         Generate a binary Goppa code and McEliece key pair.
 
-        The secret objects are
+        The secret code objects satisfy
 
-            G,
-            H,
-            S,
-            S^{-1},
-            P,
-            P^{-1}.
+            G H^T = 0,
 
-        The public generator is
+            G R = I_k.
+
+        The public generator satisfies
 
             G_pub = S G P.
 
-        In Phase 2B, P is represented by a permutation vector.
+        P is represented by a permutation vector.
         """
 
         # --------------------------------------------------------
@@ -393,10 +742,10 @@ class McElieceCipher:
         ).gen()
 
         # --------------------------------------------------------
-        # 2. Store Goppa polynomial coefficients
+        # 2. Store Goppa polynomial coefficients.
         #
-        # Every coefficient lies in GF(2^m).  Store each
-        # coefficient as its m-bit basis representation:
+        # Each coefficient in GF(2^m) is represented by its
+        # m-bit coefficient vector in the basis
         #
         #     1, alpha, ..., alpha^(m-1).
         # --------------------------------------------------------
@@ -426,9 +775,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 3. Store irreducible extension-field polynomial
-        #
-        # Coefficients are stored in ascending order.
+        # 3. Store irreducible field polynomial
         # --------------------------------------------------------
 
         self.irr_poly = np.array(
@@ -442,7 +789,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 4. Actual binary code dimension
+        # 4. Determine actual binary code dimension
         # --------------------------------------------------------
 
         self.k = (
@@ -455,9 +802,29 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 5. Generate secret permutation
+        # 5. Phase 2C: construct right inverse
         #
-        # P is a vector containing each coordinate exactly once.
+        #     G R = I_k.
+        # --------------------------------------------------------
+
+        (
+            self.R,
+            self.right_inverse_pivots,
+        ) = self._construct_right_inverse()
+
+        if self.R.arr.shape != (
+            self.n,
+            self.k,
+        ):
+            raise RuntimeError(
+                "Right inverse has unexpected "
+                f"shape {self.R.arr.shape}; "
+                f"expected "
+                f"({self.n}, {self.k})."
+            )
+
+        # --------------------------------------------------------
+        # 6. Generate secret permutation
         # --------------------------------------------------------
 
         self.P = np.random.permutation(
@@ -473,7 +840,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 6. Validate permutation and inverse
+        # 7. Validate permutation and inverse
         # --------------------------------------------------------
 
         identity_positions = np.arange(
@@ -482,19 +849,25 @@ class McElieceCipher:
         )
 
         if not np.array_equal(
-            np.sort(self.P),
+            np.sort(
+                self.P
+            ),
             identity_positions,
         ):
             raise RuntimeError(
-                "Generated P is not a valid permutation."
+                "Generated P is not a valid "
+                "permutation."
             )
 
         if not np.array_equal(
-            np.sort(self.P_inv),
+            np.sort(
+                self.P_inv
+            ),
             identity_positions,
         ):
             raise RuntimeError(
-                "Generated P_inv is not a valid permutation."
+                "Generated P_inv is not a valid "
+                "permutation."
             )
 
         if not np.array_equal(
@@ -520,7 +893,7 @@ class McElieceCipher:
             )
 
         # --------------------------------------------------------
-        # 7. Generate secret scrambling matrix
+        # 8. Generate secret scrambling matrix
         # --------------------------------------------------------
 
         self.S = GF2Matrix.from_list(
@@ -534,13 +907,13 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 8. Construct public generator
-        #
-        # Mathematically:
+        # 9. Construct public generator
         #
         #     G_pub = S G P.
         #
-        # Compute SG first, then apply P as a column permutation.
+        # With vector P:
+        #
+        #     G_pub = (S G)[:, P].
         # --------------------------------------------------------
 
         SG = (
@@ -556,7 +929,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 9. Sanity checks
+        # 10. Final key-generation sanity checks
         # --------------------------------------------------------
 
         if self.Gp.arr.shape != (
@@ -566,6 +939,31 @@ class McElieceCipher:
             raise RuntimeError(
                 "Public generator has unexpected "
                 f"shape {self.Gp.arr.shape}."
+            )
+
+        # R was already verified during construction. The following
+        # check remains in key generation, where its cost is paid
+        # only once per key pair.
+
+        GR = (
+            self.G
+            * self.R
+        )
+
+        I_k = GF2Matrix.from_list(
+            np.eye(
+                self.k,
+                dtype=np.uint8,
+            )
+        )
+
+        if not self._gf2_matrix_equal(
+            GR,
+            I_k,
+        ):
+            raise RuntimeError(
+                "Key-generation sanity check "
+                "failed: G R != I_k."
             )
 
         log.info(
@@ -581,7 +979,7 @@ class McElieceCipher:
         msg_arr,
     ):
         """
-        Encrypt a k-bit message using the public generator matrix.
+        Encrypt a k-bit message using the public generator.
 
         Baseline McEliece encryption computes
 
@@ -621,6 +1019,14 @@ class McElieceCipher:
             raise ValueError(
                 f"Cannot insert {self.t} errors "
                 f"into a ciphertext of length {n}."
+            )
+
+        if not np.all(
+            (msg_arr == 0)
+            | (msg_arr == 1)
+        ):
+            raise ValueError(
+                "Plaintext must be binary."
             )
 
         log.debug(
@@ -686,8 +1092,7 @@ class McElieceCipher:
         syndrome,
     ):
         """
-        Repair errors using the Patterson-style decoder from the
-        original implementation.
+        Repair errors using the Patterson-style decoder.
 
         The current Goppa support is
 
@@ -947,24 +1352,31 @@ class McElieceCipher:
                 f"H1 = {H1}"
             )
 
-            R = (
+            # ----------------------------------------------------
+            # Patterson auxiliary polynomial.
+            #
+            # Use R_poly to distinguish it from self.R, which is
+            # the generator right inverse introduced in Phase 2C.
+            # ----------------------------------------------------
+
+            R_poly = (
                 H0
                 +
                 w * H1
             )
 
             log.debug(
-                f"R = {R}"
+                f"R_poly = {R_poly}"
             )
 
             log.debug(
-                "R^2 mod g = "
-                f"{(R ** 2) % self.g_poly}"
+                "R_poly^2 mod g = "
+                f"{(R_poly ** 2) % self.g_poly}"
             )
 
             b, _, a = (
                 ext_euclid_poly_alt(
-                    R,
+                    R_poly,
                     self.g_poly,
                     ring,
                     self.t,
@@ -1011,9 +1423,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 5. Evaluate locator polynomial on support
-        #
-        # Current support:
+        # 5. Evaluate locator polynomial on current support
         #
         #     1, alpha, alpha^2, ...
         # --------------------------------------------------------
@@ -1067,17 +1477,27 @@ class McElieceCipher:
 
             s = c H^T.
 
-        If s != 0, Patterson error correction is applied.
+        If
 
-        The corrected codeword then satisfies
+            s != 0,
 
-            c_clean = a G,
+        Patterson correction is applied.
 
-        and a is recovered by solving the corresponding binary
-        linear system.
+        After correction,
 
-        The RREF message-recovery step will be replaced by a
-        precomputed right inverse in Phase 2C.
+            c_clean = a G.
+
+        Phase 2C recovers a directly using
+
+            a = c_clean R,
+
+        where
+
+            G R = I_k.
+
+        The right inverse is constructed and verified during key
+        generation. No G R verification or reconstruction check is
+        performed for every ciphertext.
         """
 
         if self.G is None:
@@ -1123,7 +1543,7 @@ class McElieceCipher:
         # --------------------------------------------------------
         # 1. Syndrome
         #
-        #     s = c H^T
+        #     s = c H^T.
         # --------------------------------------------------------
 
         syndrome = (
@@ -1154,7 +1574,10 @@ class McElieceCipher:
             )
 
             # ----------------------------------------------------
-            # Verify repaired word is in the code
+            # Verify that Patterson produced a codeword.
+            #
+            # This check remains useful because it verifies the
+            # error-correction result itself.
             # ----------------------------------------------------
 
             repaired_syndrome = (
@@ -1177,59 +1600,70 @@ class McElieceCipher:
                 )
 
         # --------------------------------------------------------
-        # 3. Recover a from
+        # 3. Phase 2C information-vector recovery
         #
-        #     a G = c_clean.
+        # After Patterson correction:
         #
-        # Solve by RREF of
+        #     c_clean = a G.
         #
-        #     (G^T | c_clean^T).
+        # Since
         #
-        # This remains the principal decoding scalability
-        # bottleneck and will be removed in Phase 2C.
+        #     G R = I_k,
+        #
+        #     a = c_clean R.
+        #
+        # R is verified during its construction. We deliberately
+        # do not recompute G R during every decode operation.
         # --------------------------------------------------------
 
-        augmented_numpy = np.append(
-            G.arr.T,
-            msg_arr.arr.reshape(
-                n,
-                1,
-            ),
-            axis=1,
+        if self.R is None:
+            # Phase 2B serialized private keys do not yet contain R.
+            # During the transition to the Phase 2C key format,
+            # reconstruct it lazily once when necessary.
+            (
+                self.R,
+                self.right_inverse_pivots,
+            ) = self._construct_right_inverse()
+
+        R = self._as_gf2_matrix(
+            self.R
         )
 
-        augmented = (
-            GF2Matrix.from_list(
-                augmented_numpy
+        if R.arr.shape != (
+            n,
+            k,
+        ):
+            raise RuntimeError(
+                f"Right inverse has shape "
+                f"{R.arr.shape}; "
+                f"expected ({n}, {k})."
             )
+
+        # --------------------------------------------------------
+        # Direct information extraction
+        #
+        # Cost after Patterson correction:
+        #
+        #     (1 x n)(n x k),
+        #
+        # approximately O(nk) binary operations.
+        # --------------------------------------------------------
+
+        message = (
+            msg_arr
+            * R
         )
 
-        log.debug(
-            "G^T | c^T =\n"
-            f"{augmented}"
-        )
+        if message.arr.shape != (
+            k,
+        ):
+            raise RuntimeError(
+                "Right-inverse message recovery "
+                f"produced shape {message.arr.shape}; "
+                f"expected ({k},)."
+            )
 
-        reduced = rref(
-            augmented,
-            steps=k,
-        )
-
-        log.debug(
-            "RREF(G^T | c^T) =\n"
-            f"{reduced}"
-        )
-
-        message_column = (
-            reduced[
-                :k,
-                k:
-            ]
-            .flatten()
-        )
-
-        return GF2Matrix.from_list(
-            message_column
-        )
+        return message
 
     # ============================================================
     # Decryption
@@ -1245,28 +1679,42 @@ class McElieceCipher:
         Encryption has the form
 
             c_pub
-                = m S G P + e_pub.
+              = m S G P + e_pub.
 
-        With the vector-permutation convention
-
-            x P = x[P],
-
-        undoing the permutation gives
+        Undoing the vector permutation gives
 
             c_sec
-                = c_pub[P_inv]
-                = m S G + e_sec.
+              = c_pub[P_inv]
+              = m S G + e_sec.
 
-        Patterson decoding recovers
+        Patterson decoding produces the clean codeword
 
-            m S,
+            (m S) G.
 
-        after which multiplication by S^{-1} gives m.
+        Phase 2C then recovers
+
+            m S
+              = ((m S) G) R,
+
+        because
+
+            G R = I_k.
+
+        Finally,
+
+            m
+              = (m S) S^{-1}.
         """
 
         if self.H is None:
             raise RuntimeError(
                 "Private parity-check matrix H "
+                "is unavailable."
+            )
+
+        if self.G is None:
+            raise RuntimeError(
+                "Private generator matrix G "
                 "is unavailable."
             )
 
@@ -1322,7 +1770,7 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 1. Undo secret permutation
+        # 1. Undo secret coordinate permutation
         #
         # If
         #
@@ -1346,9 +1794,11 @@ class McElieceCipher:
         )
 
         # --------------------------------------------------------
-        # 2. Patterson decode
+        # 2. Patterson decode and right-inverse extraction
         #
-        # This produces the scrambled message mS.
+        # The returned information vector is
+        #
+        #     m S.
         # --------------------------------------------------------
 
         scrambled_message = (
@@ -1365,7 +1815,7 @@ class McElieceCipher:
         # --------------------------------------------------------
         # 3. Undo scrambling
         #
-        #     m = (mS) S^{-1}.
+        #     m = (m S) S^{-1}.
         # --------------------------------------------------------
 
         message = (
@@ -1373,8 +1823,22 @@ class McElieceCipher:
             * S_inv
         )
 
+        if message.arr.shape != (
+            self.G.arr.shape[0],
+        ):
+            raise RuntimeError(
+                "Decryption produced unexpected "
+                f"message shape {message.arr.shape}."
+            )
+
         log.debug(
             f"plaintext = {message}"
         )
 
-        return message.to_numpy()
+        return (
+            message
+            .to_numpy()
+            .astype(
+                np.uint8
+            )
+        )
