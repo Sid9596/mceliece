@@ -137,17 +137,51 @@ def random_perm_matrix(n):
     return np.array([[1 if i == x else 0 for i in range(n)] for x in np.random.permutation(n)])
 
 
-def random_inv_matrix(n):
-    for i in range(1, 1000):
-        try:
-            candidate = np.random.randint(2, size=(n, n))
-            det = int(round(np.linalg.det(candidate)))
-            log.debug("Generating random matrix (det={}). Try {}...".format(det, i))
-            if det % 2 == 1:
-                return candidate
-        except ValueError:
-            pass
-    return None
+def random_inv_matrix(n, max_tries=1000):
+    """
+    Generate a random invertible n x n matrix over GF(2).
+
+    Invertibility is checked exactly over GF(2) using FLINT-backed
+    row reduction.  Floating-point determinants must not be used
+    for this purpose.
+    """
+
+    n = int(n)
+
+    if n <= 0:
+        raise ValueError(
+            "Matrix dimension n must be positive."
+        )
+
+    for attempt in range(1, max_tries + 1):
+
+        candidate = np.random.randint(
+            0,
+            2,
+            size=(n, n),
+            dtype=np.uint8,
+        )
+
+        candidate_gf2 = GF2Matrix.from_list(
+            candidate
+        )
+
+        _, rank = candidate_gf2.rref()
+
+        log.debug(
+            "Generating random GF(2) matrix "
+            f"(rank={rank}/{n}). "
+            f"Try {attempt}..."
+        )
+
+        if rank == n:
+            return candidate
+
+    raise RuntimeError(
+        f"Unable to generate an invertible "
+        f"{n}x{n} matrix over GF(2) "
+        f"after {max_tries} attempts."
+    )
 
 
 def order(x, p):
