@@ -28,22 +28,109 @@ def is_irreducible_poly(poly, p):
 
 
 def first_alpha_power_root(poly, irr_poly, p, elements_to_check=None):
-    poly = Poly([(Poly(coeff, alpha) % irr_poly).trunc(p).as_expr() for coeff in poly.all_coeffs()], x)
-    test_poly = Poly(1, alpha)
+    """
+    Return the first i > 0 such that alpha^i is a root of poly
+    in GF(p^m) = GF(p)[alpha] / (irr_poly).
+
+    All reductions in alpha are performed over GF(p), avoiding
+    mixed ZZ/GF(p) polynomial domains in modern SymPy.
+    """
+    field = GF(p)
+    irr_poly = irr_poly.set_domain(field)
+
+    # Reduce every coefficient of poly modulo irr_poly over GF(p).
+    reduced_coeffs = []
+
+    for coeff in poly.all_coeffs():
+        coeff_poly = Poly(
+            coeff,
+            alpha,
+            domain=field
+        )
+
+        coeff_poly = coeff_poly.rem(irr_poly)
+
+        reduced_coeffs.append(
+            coeff_poly.as_expr()
+        )
+
+    # Polynomial in x whose coefficients are represented
+    # as reduced polynomials in alpha.
+    poly = Poly(reduced_coeffs, x)
+
+    test_poly = Poly(
+        1,
+        alpha,
+        domain=field
+    )
+
+    alpha_poly = Poly(
+        alpha,
+        alpha,
+        domain=field
+    )
+
     log.debug(f"testing f:{poly}")
-    for i in range(1, p ** irr_poly.degree()):
-        test_poly = (Poly(Poly(alpha, alpha) * test_poly, alpha) % irr_poly).set_domain(GF(p))
-        if elements_to_check is not None and i not in elements_to_check:
+
+    for i in range(
+        1,
+        p ** irr_poly.degree()
+    ):
+        # alpha^i modulo irr_poly
+        test_poly = (
+            alpha_poly * test_poly
+        ).rem(irr_poly)
+
+        if (
+            elements_to_check is not None
+            and i not in elements_to_check
+        ):
             continue
-        value = Poly((Poly(poly.eval(test_poly.as_expr()), alpha) % irr_poly), alpha).trunc(p)
-        log.debug(f"testing alpha^{i} f({test_poly})={value}")
+
+        # Evaluate f(alpha^i).
+        value_expr = poly.as_expr().subs(
+            x,
+            test_poly.as_expr()
+        )
+
+        # Reduce the result modulo irr_poly over GF(p).
+        value = Poly(
+            value_expr,
+            alpha,
+            domain=field
+        ).rem(irr_poly)
+
+        log.debug(
+            f"testing alpha^{i} "
+            f"f({test_poly})={value}"
+        )
+
         if value.is_zero:
             return i
+
     return -1
 
 
 def is_alpha_power_root(poly, i, irr_poly, p):
-    return Poly((Poly(poly.eval(alpha ** i), alpha) % irr_poly), alpha).trunc(p).is_zero
+    """
+    Test whether alpha^i is a root of poly in
+    GF(p)[alpha] / (irr_poly).
+    """
+    field = GF(p)
+    irr_poly = irr_poly.set_domain(field)
+
+    value_expr = poly.as_expr().subs(
+        x,
+        alpha ** i
+    )
+
+    value = Poly(
+        value_expr,
+        alpha,
+        domain=field
+    ).rem(irr_poly)
+
+    return value.is_zero
 
 
 def random_perm_matrix(n):
@@ -93,12 +180,24 @@ def minimal_poly(i, n, q, irr_poly):
 
 def power_dict(n, irr, p):
     result = {(1,): 0}
-    test_poly = Poly(1, alpha)
+
+    # Keep every polynomial in the same coefficient domain GF(p).
+    field = GF(p)
+
+    test_poly = Poly(1, alpha, domain=field)
+    alpha_poly = Poly(alpha, alpha, domain=field)
+    irr = irr.set_domain(field)
+
     for i in range(1, n - 1):
-        test_poly = (Poly(Poly(alpha, alpha) * test_poly, alpha) % irr).set_domain(GF(p))
-        if tuple(test_poly.all_coeffs()) in result:
+        test_poly = (alpha_poly * test_poly) % irr
+
+        key = tuple(test_poly.all_coeffs())
+
+        if key in result:
             return result
-        result[tuple(test_poly.all_coeffs())] = i
+
+        result[key] = i
+
     return result
 
 
@@ -118,19 +217,66 @@ def ring_generate(irr, p):
 
 
 def get_alpha_power(poly, irr_poly, quotient, p, neg=False):
-    poly = (Poly(poly, alpha) % irr_poly).trunc(p)
-    if poly.is_zero:
+    """
+    Convert a nonzero element of GF(p^m) to its alpha-power
+    representation.
+
+    Polynomial arithmetic is carried out consistently over GF(p).
+    """
+    field = GF(p)
+    irr_field = irr_poly.set_domain(field)
+
+    poly_field = Poly(
+        poly,
+        alpha,
+        domain=field
+    ).rem(irr_field)
+
+    if poly_field.is_zero:
         return 0
-    power = quotient[tuple(poly.all_coeffs())]
+
+    key = tuple(poly_field.all_coeffs())
+
+    if key not in quotient:
+        raise KeyError(
+            f"Field element {poly_field} with key {key} "
+            f"is absent from the alpha-power table"
+        )
+
+    power = quotient[key]
+
     if neg:
-        power = len(quotient) - power
+        power = (len(quotient) - power) % len(quotient)
+
     return alpha ** power
 
 
 def get_binary_from_alpha(poly, irr_poly, p):
-    poly = (Poly(poly, alpha) % irr_poly).trunc(p)
-    result = np.full((irr_poly.degree(),), GF2(0))
-    result[:len(poly.all_coeffs())] = [GF2(e) for e in poly.all_coeffs()[::-1]]
+    """
+    Convert an element of GF(p^m) to its coefficient-vector
+    representation in the basis 1, alpha, ..., alpha^(m-1).
+    """
+    field = GF(p)
+    irr_field = irr_poly.set_domain(field)
+
+    poly_field = Poly(
+        poly,
+        alpha,
+        domain=field
+    ).rem(irr_field)
+
+    result = np.full(
+        (irr_poly.degree(),),
+        GF2(0)
+    )
+
+    coeffs = poly_field.all_coeffs()[::-1]
+
+    result[:len(coeffs)] = [
+        GF2(int(c) % p)
+        for c in coeffs
+    ]
+
     return result
 
 
