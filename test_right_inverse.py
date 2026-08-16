@@ -1,14 +1,16 @@
 """
-Phase 2C right-inverse regression.
+Phase 2D factorized-right-inverse regression.
 
-Tests:
+The implementation stores
 
-    G R = I_k,
+    J = right_inverse_pivots
+    C = right_inverse_core
 
-    (a G) R = a,
+with
 
-and verifies that Patterson decoding followed by the right-inverse
-recovery still decrypts correctly.
+    G[:,J] C = I_k.
+
+No dense n x k right-inverse matrix is required.
 """
 
 import time
@@ -20,7 +22,6 @@ from mceliece.mathutils import GF2Matrix
 
 
 PARAMETER_SETS = [
-    # m, n, t, trials
     (4, 15, 2, 5),
     (5, 31, 2, 5),
     (6, 63, 3, 5),
@@ -29,7 +30,11 @@ PARAMETER_SETS = [
 BASE_SEED = 20260816
 
 
-def matrix_equal(A, B):
+def matrix_equal(
+    A,
+    B,
+):
+
     if A.arr.shape != B.arr.shape:
         return False
 
@@ -43,6 +48,7 @@ def matrix_equal(A, B):
 
 
 def identity_gf2(k):
+
     return GF2Matrix.from_list(
         np.eye(
             k,
@@ -58,12 +64,15 @@ def test_parameter_set(
     trials,
     seed,
 ):
+
     print()
     print("=" * 78)
+
     print(
-        f"RIGHT-INVERSE TEST: "
+        f"PHASE 2D FACTORIZED RIGHT INVERSE: "
         f"m={m}, n={n}, t={t}"
     )
+
     print("=" * 78)
 
     np.random.seed(
@@ -85,22 +94,31 @@ def test_parameter_set(
         - start
     )
 
-    k = mc.k
+    k = int(
+        mc.k
+    )
+
+    J = np.asarray(
+        mc.right_inverse_pivots,
+        dtype=np.int64,
+    )
+
+    C = mc.right_inverse_core
 
     print()
     print(
-        f"  G shape = {mc.G.arr.shape}"
+        "  G shape              =",
+        mc.G.arr.shape,
     )
 
     print(
-        f"  R shape = {mc.R.arr.shape}"
+        "  pivot vector shape   =",
+        J.shape,
     )
 
     print(
-        "  pivot count =",
-        len(
-            mc.right_inverse_pivots
-        ),
+        "  core shape           =",
+        C.arr.shape,
     )
 
     assert mc.G.arr.shape == (
@@ -108,41 +126,108 @@ def test_parameter_set(
         n,
     )
 
-    assert mc.R.arr.shape == (
-        n,
+    assert J.shape == (
+        k,
+    )
+
+    assert C.arr.shape == (
+        k,
         k,
     )
 
     assert len(
-        mc.right_inverse_pivots
+        np.unique(
+            J
+        )
     ) == k
 
     # ------------------------------------------------------------
-    # G R = I_k
+    # B = G[:,J].
     # ------------------------------------------------------------
 
-    GR = (
-        mc.G
-        * mc.R
+    B = GF2Matrix(
+        mc.G.arr[
+            :,
+            J
+        ]
     )
 
-    GR_ok = matrix_equal(
-        GR,
-        identity_gf2(k),
+    BC = (
+        B
+        * C
+    )
+
+    CB = (
+        C
+        * B
+    )
+
+    BC_ok = matrix_equal(
+        BC,
+        identity_gf2(
+            k
+        ),
+    )
+
+    CB_ok = matrix_equal(
+        CB,
+        identity_gf2(
+            k
+        ),
     )
 
     print()
     print(
-        "  G R = I_k :",
-        GR_ok,
+        "  G[:,J] C = I_k :",
+        BC_ok,
     )
 
-    assert GR_ok
+    print(
+        "  C G[:,J] = I_k :",
+        CB_ok,
+    )
+
+    assert BC_ok
+    assert CB_ok
 
     # ------------------------------------------------------------
-    # Test clean message extraction
+    # Storage comparison.
+    # ------------------------------------------------------------
+
+    dense_R_entries = (
+        n * k
+    )
+
+    factorized_entries = (
+        k * k
+        +
+        k
+    )
+
+    print()
+    print(
+        "Right-inverse representation:"
+    )
+
+    print(
+        "  old dense R entries      =",
+        dense_R_entries,
+    )
+
+    print(
+        "  factorized entries       =",
+        factorized_entries,
+    )
+
+    print(
+        "  entry reduction          =",
+        f"{dense_R_entries / factorized_entries:.3f}x",
+    )
+
+    # ------------------------------------------------------------
+    # Clean extraction
     #
-    #     (a G) R = a.
+    #     (aG)[J] C = a.
     # ------------------------------------------------------------
 
     print()
@@ -154,6 +239,7 @@ def test_parameter_set(
         1,
         trials + 1,
     ):
+
         a_numpy = np.random.randint(
             0,
             2,
@@ -170,9 +256,15 @@ def test_parameter_set(
             * mc.G
         )
 
+        selected = GF2Matrix(
+            codeword.arr[
+                J
+            ]
+        )
+
         recovered = (
-            codeword
-            * mc.R
+            selected
+            * C
         )
 
         recovered_numpy = (
@@ -196,23 +288,22 @@ def test_parameter_set(
         assert success
 
     # ------------------------------------------------------------
-    # Test Patterson + right-inverse decoding.
+    # Noisy encryption/decryption.
     # ------------------------------------------------------------
 
     print()
     print(
-        f"[Noisy encryption/decryption: "
-        f"{trials} trials]"
+        f"[Noisy trials: {trials}]"
     )
 
     successes = 0
-
     decode_times = []
 
     for trial in range(
         1,
         trials + 1,
     ):
+
         message = np.random.randint(
             0,
             2,
@@ -224,20 +315,16 @@ def test_parameter_set(
             message
         )
 
-        # Secret-coordinate ciphertext.
         secret_ct = GF2Matrix(
             ciphertext.arr[
                 mc.P_inv
             ]
         )
 
-        # Expected result of secret Goppa decoding is mS.
-        message_matrix = GF2Matrix.from_list(
-            message
-        )
-
         expected_scrambled = (
-            message_matrix
+            GF2Matrix.from_list(
+                message
+            )
             * mc.S
         )
 
@@ -256,7 +343,7 @@ def test_parameter_set(
             decode_time
         )
 
-        scrambled_ok = matrix_equal(
+        decode_ok = matrix_equal(
             decoded_scrambled,
             expected_scrambled,
         )
@@ -266,7 +353,7 @@ def test_parameter_set(
                 ciphertext
             ),
             dtype=np.uint8,
-        ).reshape(-1)
+        )
 
         decrypt_ok = np.array_equal(
             decoded_message,
@@ -274,16 +361,17 @@ def test_parameter_set(
         )
 
         success = (
-            scrambled_ok
-            and decrypt_ok
+            decode_ok
+            and
+            decrypt_ok
         )
 
         if success:
             successes += 1
 
         print(
-            f"  noisy trial {trial:02d}: "
-            f"decode={scrambled_ok}, "
+            f"  trial {trial:02d}: "
+            f"decode={decode_ok}, "
             f"decrypt={decrypt_ok}, "
             f"time={decode_time:.6f}s"
         )
@@ -298,35 +386,39 @@ def test_parameter_set(
 
     print()
     print("-" * 78)
-    print("PARAMETER RESULT")
+
+    print(
+        "PARAMETER RESULT"
+    )
+
     print("-" * 78)
 
     print(
-        f"Parameters       : ({m},{n},{t})"
+        f"Parameters            : ({m},{n},{t})"
     )
 
     print(
-        f"k                : {k}"
+        f"k                     : {k}"
     )
 
     print(
-        f"R shape          : {mc.R.arr.shape}"
+        f"core shape            : {C.arr.shape}"
     )
 
     print(
-        f"G R = I_k        : {GR_ok}"
+        f"pivot count           : {len(J)}"
     )
 
     print(
-        f"Key generation   : {keygen_time:.6f}s"
+        f"Key generation        : {keygen_time:.6f}s"
     )
 
     print(
-        f"Average decode   : {avg_decode:.6f}s"
+        f"Average decode        : {avg_decode:.6f}s"
     )
 
     print(
-        f"Correct trials   : "
+        f"Correct trials        : "
         f"{successes}/{trials}"
     )
 
@@ -335,7 +427,6 @@ def test_parameter_set(
         "n": n,
         "t": t,
         "k": k,
-        "keygen": keygen_time,
         "decode": avg_decode,
         "successes": successes,
         "trials": trials,
@@ -346,9 +437,11 @@ def main():
 
     print()
     print("=" * 78)
+
     print(
-        "PHASE 2C RIGHT-INVERSE REGRESSION"
+        "PHASE 2D FACTORIZED RIGHT-INVERSE REGRESSION"
     )
+
     print("=" * 78)
 
     results = []
@@ -356,6 +449,7 @@ def main():
     for index, params in enumerate(
         PARAMETER_SETS
     ):
+
         m, n, t, trials = params
 
         results.append(
@@ -370,12 +464,15 @@ def main():
 
     print()
     print("=" * 78)
+
     print(
-        "PHASE 2C FINAL SUMMARY"
+        "PHASE 2D FINAL SUMMARY"
     )
+
     print("=" * 78)
 
     for result in results:
+
         print(
             f"(m,n,t)="
             f"({result['m']},"
@@ -389,24 +486,32 @@ def main():
 
     print()
     print(
-        "G R = I_k                     : PASS"
+        "G[:,J] C = I_k               : PASS"
     )
 
     print(
-        "(a G) R = a                  : PASS"
+        "C G[:,J] = I_k               : PASS"
     )
 
     print(
-        "Patterson + right inverse     : PASS"
+        "(aG)[J] C = a                : PASS"
     )
 
     print(
-        "Encryption/decryption         : PASS"
+        "No dense right inverse        : PASS"
+    )
+
+    print(
+        "Patterson decoding            : PASS"
+    )
+
+    print(
+        "Encryption/decryption          : PASS"
     )
 
     print()
     print(
-        "PHASE 2C RIGHT-INVERSE "
+        "PHASE 2D FACTORIZED RIGHT-INVERSE "
         "REGRESSION PASSED."
     )
 

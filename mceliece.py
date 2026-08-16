@@ -18,17 +18,14 @@ Options:
   -d, --debug        Debug mode.
   -v, --verbose      Verbose mode.
 
-Phase 2C key format
--------------------
-
-Private key:
+Phase 2D private-key format:
 
     format_version
     m, n, t, k
     G
     H
-    R
     right_inverse_pivots
+    right_inverse_core
     S
     S_inv
     P
@@ -36,39 +33,16 @@ Private key:
     g_poly
     irr_poly
 
-Public key:
+where
 
-    format_version
-    m, n, t, k
-    Gp
+    J = right_inverse_pivots,
+    C = right_inverse_core,
 
-The secret generator right inverse satisfies
+and
 
-    G R = I_k.
+    G[:,J] C = I_k.
 
-The right inverse has dimensions
-
-    R : n x k.
-
-The vector
-
-    right_inverse_pivots : shape (k,)
-
-contains the k independent columns of G used to construct R.
-
-Binary matrices are serialized as primitive uint8 NumPy arrays.
-
-The secret McEliece permutation is serialized as
-
-    P     : int64[n]
-    P_inv : int64[n]
-
-rather than dense n x n permutation matrices.
-
-No Python objects are stored in the NPZ files. Keys are therefore
-loaded using
-
-    allow_pickle=False.
+No dense n x k right inverse is serialized.
 """
 
 import ast
@@ -89,29 +63,21 @@ from padding.padding import (
 log = logging.getLogger("mceliece")
 
 
-# ================================================================
-# Key-format version
-# ================================================================
-
-KEY_FORMAT_VERSION = 3
+KEY_FORMAT_VERSION = 4
 
 
 # ================================================================
-# GF(2) serialization helpers
+# GF(2) helpers
 # ================================================================
 
 def gf2_matrix_to_uint8(matrix):
-    """
-    Convert a GF2Matrix into an ordinary uint8 NumPy array while
-    preserving its shape.
-    """
 
     if not isinstance(
         matrix,
         GF2Matrix,
     ):
         raise TypeError(
-            "gf2_matrix_to_uint8 expects GF2Matrix."
+            "Expected GF2Matrix."
         )
 
     return np.array(
@@ -126,9 +92,6 @@ def gf2_matrix_to_uint8(matrix):
 
 
 def uint8_to_gf2_matrix(array):
-    """
-    Convert a binary NumPy array into GF2Matrix.
-    """
 
     array = np.asarray(
         array,
@@ -141,7 +104,7 @@ def uint8_to_gf2_matrix(array):
         (array == 1)
     ):
         raise ValueError(
-            "Serialized GF(2) matrix contains "
+            "GF(2) data contains "
             "entries outside {0,1}."
         )
 
@@ -154,25 +117,6 @@ def gf2_matrix_equal(
     A,
     B,
 ):
-    """
-    Compare two GF2Matrix objects.
-    """
-
-    if not isinstance(
-        A,
-        GF2Matrix,
-    ):
-        raise TypeError(
-            "A must be GF2Matrix."
-        )
-
-    if not isinstance(
-        B,
-        GF2Matrix,
-    ):
-        raise TypeError(
-            "B must be GF2Matrix."
-        )
 
     if A.arr.shape != B.arr.shape:
         return False
@@ -187,21 +131,18 @@ def gf2_matrix_equal(
     )
 
 
-def gf2_identity(size):
-    """
-    Construct I_size over GF(2).
-    """
+def gf2_identity(k):
 
     return GF2Matrix.from_list(
         np.eye(
-            size,
+            k,
             dtype=np.uint8,
         )
     )
 
 
 # ================================================================
-# Permutation helpers
+# Permutations
 # ================================================================
 
 def validate_permutation(
@@ -209,9 +150,6 @@ def validate_permutation(
     n,
     name,
 ):
-    """
-    Validate a length-n permutation vector.
-    """
 
     permutation = np.asarray(
         permutation,
@@ -222,8 +160,7 @@ def validate_permutation(
         n,
     ):
         raise ValueError(
-            f"{name} must have shape ({n},), "
-            f"received {permutation.shape}."
+            f"{name} must have shape ({n},)."
         )
 
     identity = np.arange(
@@ -238,8 +175,7 @@ def validate_permutation(
         identity,
     ):
         raise ValueError(
-            f"{name} is not a valid permutation "
-            f"of 0,...,{n - 1}."
+            f"{name} is not a valid permutation."
         )
 
     return permutation
@@ -250,13 +186,6 @@ def validate_permutation_pair(
     P_inv,
     n,
 ):
-    """
-    Validate P and P_inv and verify
-
-        P[P_inv] = identity,
-
-        P_inv[P] = identity.
-    """
 
     P = validate_permutation(
         P,
@@ -302,101 +231,14 @@ def validate_permutation_pair(
 
 
 # ================================================================
-# Phase 2C right-inverse validation
+# Phase 2D factorized right-inverse validation
 # ================================================================
 
-def validate_right_inverse_pivots(
-    pivots,
-    n,
-    k,
-):
-    """
-    Validate the pivot indices associated with the sparse right
-    inverse construction.
-
-    The vector must contain k distinct indices from
-
-        {0, ..., n-1}.
-    """
-
-    pivots = np.asarray(
-        pivots,
-        dtype=np.int64,
-    ).reshape(-1)
-
-    if pivots.shape != (
-        k,
-    ):
-        raise ValueError(
-            "right_inverse_pivots must have "
-            f"shape ({k},), "
-            f"received {pivots.shape}."
-        )
-
-    if np.any(
-        pivots < 0
-    ):
-        raise ValueError(
-            "right_inverse_pivots contains "
-            "a negative index."
-        )
-
-    if np.any(
-        pivots >= n
-    ):
-        raise ValueError(
-            "right_inverse_pivots contains "
-            "an index outside the code length."
-        )
-
-    if len(
-        np.unique(
-            pivots
-        )
-    ) != k:
-        raise ValueError(
-            "right_inverse_pivots must contain "
-            "k distinct indices."
-        )
-
-    return pivots
-
-
-def validate_right_inverse(
+def validate_right_inverse_factorization(
     G,
-    R,
     pivots,
+    core,
 ):
-    """
-    Validate a serialized Phase 2C right inverse.
-
-    Required properties:
-
-        G in GF(2)^{k x n},
-
-        R in GF(2)^{n x k},
-
-        G R = I_k.
-
-    For the current sparse construction, rows outside the selected
-    pivot positions are required to be zero.
-
-    Parameters
-    ----------
-    G : GF2Matrix
-        Generator matrix.
-
-    R : GF2Matrix
-        Proposed right inverse.
-
-    pivots : array-like
-        Selected independent columns of G.
-
-    Returns
-    -------
-    numpy.ndarray
-        Validated pivot vector.
-    """
 
     if not isinstance(
         G,
@@ -407,96 +249,61 @@ def validate_right_inverse(
         )
 
     if not isinstance(
-        R,
+        core,
         GF2Matrix,
     ):
         raise TypeError(
-            "R must be GF2Matrix."
-        )
-
-    if G.arr.ndim != 2:
-        raise ValueError(
-            "G must be two-dimensional."
-        )
-
-    if R.arr.ndim != 2:
-        raise ValueError(
-            "R must be two-dimensional."
+            "core must be GF2Matrix."
         )
 
     k, n = G.arr.shape
 
-    if R.arr.shape != (
-        n,
-        k,
-    ):
-        raise ValueError(
-            f"R has shape {R.arr.shape}; "
-            f"expected ({n},{k})."
-        )
-
-    pivots = validate_right_inverse_pivots(
+    pivots = np.asarray(
         pivots,
-        n,
+        dtype=np.int64,
+    ).reshape(-1)
+
+    if pivots.shape != (
         k,
-    )
-
-    # ------------------------------------------------------------
-    # Verify G R = I_k.
-    # ------------------------------------------------------------
-
-    GR = (
-        G
-        * R
-    )
-
-    identity = gf2_identity(
-        k
-    )
-
-    if not gf2_matrix_equal(
-        GR,
-        identity,
     ):
         raise ValueError(
-            "Invalid right inverse: G R != I_k."
+            "right_inverse_pivots has "
+            f"shape {pivots.shape}; "
+            f"expected ({k},)."
         )
 
-    # ------------------------------------------------------------
-    # Verify sparse-selector representation.
-    #
-    # Rows outside the pivot positions should be zero.
-    # ------------------------------------------------------------
+    if len(
+        np.unique(
+            pivots
+        )
+    ) != k:
+        raise ValueError(
+            "right_inverse_pivots contains duplicates."
+        )
 
-    R_numpy = gf2_matrix_to_uint8(
-        R
-    )
-
-    nonpivot_mask = np.ones(
-        n,
-        dtype=bool,
-    )
-
-    nonpivot_mask[
-        pivots
-    ] = False
-
-    if np.any(
-        R_numpy[
-            nonpivot_mask,
-            :
-        ]
+    if (
+        np.any(
+            pivots < 0
+        )
+        or
+        np.any(
+            pivots >= n
+        )
     ):
         raise ValueError(
-            "Serialized R contains nonzero rows "
-            "outside right_inverse_pivots."
+            "right_inverse_pivots contains "
+            "invalid coordinates."
         )
 
-    # ------------------------------------------------------------
-    # Verify the pivot submatrix relation directly:
-    #
-    #     G[:,J] R[J,:] = I_k.
-    # ------------------------------------------------------------
+    if core.arr.shape != (
+        k,
+        k,
+    ):
+        raise ValueError(
+            "right_inverse_core has shape "
+            f"{core.arr.shape}; "
+            f"expected ({k},{k})."
+        )
 
     B = GF2Matrix(
         G.arr[
@@ -505,32 +312,33 @@ def validate_right_inverse(
         ]
     )
 
-    R_selected = GF2Matrix(
-        R.arr[
-            pivots,
-            :
-        ]
-    )
-
-    local_identity = (
-        B
-        * R_selected
+    identity = gf2_identity(
+        k
     )
 
     if not gf2_matrix_equal(
-        local_identity,
+        B * core,
         identity,
     ):
         raise ValueError(
-            "Pivot representation is inconsistent: "
-            "G[:,pivots] R[pivots,:] != I_k."
+            "Invalid factorization: "
+            "G[:,J] C != I_k."
+        )
+
+    if not gf2_matrix_equal(
+        core * B,
+        identity,
+    ):
+        raise ValueError(
+            "Invalid factorization: "
+            "C G[:,J] != I_k."
         )
 
     return pivots
 
 
 # ================================================================
-# Key generation and serialization
+# Key generation
 # ================================================================
 
 def generate(
@@ -540,12 +348,6 @@ def generate(
     priv_key_file,
     pub_key_file,
 ):
-    """
-    Generate a McEliece key pair and serialize it using primitive
-    NumPy numerical arrays.
-
-    Phase 2C serializes the precomputed generator right inverse R.
-    """
 
     m = int(
         m
@@ -571,10 +373,6 @@ def generate(
         mc.k
     )
 
-    # ------------------------------------------------------------
-    # Validate Phase 2B permutation representation.
-    # ------------------------------------------------------------
-
     (
         P,
         P_inv,
@@ -584,32 +382,23 @@ def generate(
         n,
     )
 
-    # ------------------------------------------------------------
-    # Validate Phase 2C right inverse.
-    # ------------------------------------------------------------
-
-    if mc.R is None:
+    if mc.right_inverse_core is None:
         raise RuntimeError(
-            "Key generation did not construct R."
+            "right_inverse_core was not generated."
         )
 
     if mc.right_inverse_pivots is None:
         raise RuntimeError(
-            "Key generation did not construct "
-            "right_inverse_pivots."
+            "right_inverse_pivots was not generated."
         )
 
-    validated_pivots = (
-        validate_right_inverse(
+    pivots = (
+        validate_right_inverse_factorization(
             mc.G,
-            mc.R,
             mc.right_inverse_pivots,
+            mc.right_inverse_core,
         )
     )
-
-    # ------------------------------------------------------------
-    # Convert GF(2) objects to primitive uint8 arrays.
-    # ------------------------------------------------------------
 
     G = gf2_matrix_to_uint8(
         mc.G
@@ -619,8 +408,8 @@ def generate(
         mc.H
     )
 
-    R = gf2_matrix_to_uint8(
-        mc.R
+    core = gf2_matrix_to_uint8(
+        mc.right_inverse_core
     )
 
     S = gf2_matrix_to_uint8(
@@ -645,10 +434,7 @@ def generate(
         dtype=np.uint8,
     )
 
-    # ------------------------------------------------------------
-    # Private key
-    # ------------------------------------------------------------
-
+    # Private key.
     np.savez_compressed(
         priv_key_file,
 
@@ -681,13 +467,13 @@ def generate(
 
         H=H,
 
-        R=R,
-
         right_inverse_pivots=(
-            validated_pivots.astype(
+            pivots.astype(
                 np.int64
             )
         ),
+
+        right_inverse_core=core,
 
         S=S,
 
@@ -711,10 +497,7 @@ def generate(
         priv_key_file,
     )
 
-    # ------------------------------------------------------------
-    # Public key
-    # ------------------------------------------------------------
-
+    # Public key.
     np.savez_compressed(
         pub_key_file,
 
@@ -761,9 +544,6 @@ def generate(
 def load_public_key(
     pub_key_file,
 ):
-    """
-    Load a Phase 2C public key using allow_pickle=False.
-    """
 
     with np.load(
         pub_key_file,
@@ -841,9 +621,7 @@ def load_public_key(
         n,
     ):
         raise ValueError(
-            "Serialized public generator has "
-            f"shape {Gp_array.shape}; "
-            f"expected ({k},{n})."
+            "G_pub has invalid dimensions."
         )
 
     mc = McElieceCipher(
@@ -868,16 +646,6 @@ def load_public_key(
 def load_private_key(
     priv_key_file,
 ):
-    """
-    Load a Phase 2C private key using allow_pickle=False.
-
-    The stored generator right inverse is checked once during loading:
-
-        G R = I_k.
-
-    After successful loading, normal decryption can use R directly
-    without reconstructing it.
-    """
 
     with np.load(
         priv_key_file,
@@ -892,8 +660,8 @@ def load_private_key(
             "k",
             "G",
             "H",
-            "R",
             "right_inverse_pivots",
+            "right_inverse_core",
             "S",
             "S_inv",
             "P",
@@ -964,17 +732,19 @@ def load_private_key(
             dtype=np.uint8,
         )
 
-        R_array = np.asarray(
-            key["R"],
-            dtype=np.uint8,
-        )
-
-        right_inverse_pivots = np.asarray(
+        pivots = np.asarray(
             key[
                 "right_inverse_pivots"
             ],
             dtype=np.int64,
         ).reshape(-1)
+
+        core_array = np.asarray(
+            key[
+                "right_inverse_core"
+            ],
+            dtype=np.uint8,
+        )
 
         S_array = np.asarray(
             key["S"],
@@ -1006,48 +776,38 @@ def load_private_key(
             dtype=np.uint8,
         )
 
-    # ------------------------------------------------------------
-    # Dimension checks
-    # ------------------------------------------------------------
-
     if G_array.shape != (
         k,
         n,
     ):
         raise ValueError(
-            "Serialized G has shape "
-            f"{G_array.shape}; "
-            f"expected ({k},{n})."
+            "Serialized G has invalid dimensions."
         )
 
-    if H_array.ndim != 2:
+    if (
+        H_array.ndim != 2
+        or
+        H_array.shape[1] != n
+    ):
         raise ValueError(
-            "Serialized H must be two-dimensional."
+            "Serialized H has invalid dimensions."
         )
 
-    if H_array.shape[1] != n:
-        raise ValueError(
-            "Serialized H has incorrect "
-            "number of columns."
-        )
-
-    if R_array.shape != (
-        n,
+    if pivots.shape != (
         k,
     ):
         raise ValueError(
-            "Serialized R has shape "
-            f"{R_array.shape}; "
-            f"expected ({n},{k})."
+            "Serialized pivot vector has "
+            "invalid dimensions."
         )
 
-    if right_inverse_pivots.shape != (
+    if core_array.shape != (
+        k,
         k,
     ):
         raise ValueError(
-            "Serialized right_inverse_pivots "
-            f"has shape {right_inverse_pivots.shape}; "
-            f"expected ({k},)."
+            "Serialized right-inverse core "
+            "has invalid dimensions."
         )
 
     if S_array.shape != (
@@ -1055,9 +815,7 @@ def load_private_key(
         k,
     ):
         raise ValueError(
-            "Serialized S has shape "
-            f"{S_array.shape}; "
-            f"expected ({k},{k})."
+            "Serialized S has invalid dimensions."
         )
 
     if S_inv_array.shape != (
@@ -1065,14 +823,8 @@ def load_private_key(
         k,
     ):
         raise ValueError(
-            "Serialized S_inv has shape "
-            f"{S_inv_array.shape}; "
-            f"expected ({k},{k})."
+            "Serialized S_inv has invalid dimensions."
         )
-
-    # ------------------------------------------------------------
-    # Validate permutation representation.
-    # ------------------------------------------------------------
 
     (
         P,
@@ -1083,10 +835,6 @@ def load_private_key(
         n,
     )
 
-    # ------------------------------------------------------------
-    # Convert binary matrices.
-    # ------------------------------------------------------------
-
     G = uint8_to_gf2_matrix(
         G_array
     )
@@ -1095,8 +843,8 @@ def load_private_key(
         H_array
     )
 
-    R = uint8_to_gf2_matrix(
-        R_array
+    core = uint8_to_gf2_matrix(
+        core_array
     )
 
     S = uint8_to_gf2_matrix(
@@ -1107,45 +855,23 @@ def load_private_key(
         S_inv_array
     )
 
-    # ------------------------------------------------------------
-    # Phase 2C right-inverse validation.
-    #
-    # This is the one-time load-time check:
-    #
-    #     G R = I_k.
-    # ------------------------------------------------------------
-
-    validated_pivots = (
-        validate_right_inverse(
+    pivots = (
+        validate_right_inverse_factorization(
             G,
-            R,
-            right_inverse_pivots,
+            pivots,
+            core,
         )
     )
 
-    # ------------------------------------------------------------
-    # Verify scrambling inverse once while loading.
-    # ------------------------------------------------------------
-
-    SS_inv = (
-        S
-        * S_inv
-    )
-
     if not gf2_matrix_equal(
-        SS_inv,
+        S * S_inv,
         gf2_identity(
             k
         ),
     ):
         raise ValueError(
-            "Serialized scrambling matrices are "
-            "inconsistent: S S_inv != I_k."
+            "S S_inv != I_k."
         )
-
-    # ------------------------------------------------------------
-    # Reconstruct McElieceCipher.
-    # ------------------------------------------------------------
 
     mc = McElieceCipher(
         m,
@@ -1159,10 +885,12 @@ def load_private_key(
 
     mc.H = H
 
-    mc.R = R
-
     mc.right_inverse_pivots = (
-        validated_pivots
+        pivots
+    )
+
+    mc.right_inverse_core = (
+        core
     )
 
     mc.S = S
@@ -1181,7 +909,7 @@ def load_private_key(
 
 
 # ================================================================
-# Encryption using serialized public key
+# Encryption
 # ================================================================
 
 def encrypt(
@@ -1189,9 +917,6 @@ def encrypt(
     input_arr,
     block=False,
 ):
-    """
-    Encrypt using a public key loaded from disk.
-    """
 
     mc = load_public_key(
         pub_key_file
@@ -1219,19 +944,13 @@ def encrypt(
             "Input must be binary."
         )
 
-    # ------------------------------------------------------------
-    # Single-block encryption
-    # ------------------------------------------------------------
-
     if not block:
 
         if len(
             input_arr
         ) != k:
             raise ValueError(
-                "Single-block plaintext must contain "
-                f"exactly {k} bits; "
-                f"received {len(input_arr)}."
+                f"Plaintext must contain {k} bits."
             )
 
         return (
@@ -1244,30 +963,19 @@ def encrypt(
             )
         )
 
-    # ------------------------------------------------------------
-    # Multi-block encryption
-    # ------------------------------------------------------------
-
-    padded = padding_encode(
-        input_arr,
-        k,
-    )
-
     padded = np.asarray(
-        padded,
+        padding_encode(
+            input_arr,
+            k,
+        ),
         dtype=np.uint8,
     )
 
-    if (
-        len(
-            padded
-        )
-        % k
-        != 0
-    ):
+    if len(
+        padded
+    ) % k != 0:
         raise RuntimeError(
-            "Padding did not produce a multiple "
-            "of the plaintext block size."
+            "Invalid padded plaintext length."
         )
 
     blocks = padded.reshape(
@@ -1325,7 +1033,7 @@ def encrypt(
 
 
 # ================================================================
-# Decryption using serialized private key
+# Decryption
 # ================================================================
 
 def decrypt(
@@ -1333,12 +1041,6 @@ def decrypt(
     input_arr,
     block=False,
 ):
-    """
-    Decrypt using a Phase 2C private key loaded from disk.
-
-    The loaded private key already contains R, so normal decryption
-    does not need to reconstruct the generator right inverse.
-    """
 
     mc = load_private_key(
         priv_key_file
@@ -1352,10 +1054,16 @@ def decrypt(
         mc.G.arr.shape[0]
     )
 
-    if mc.R is None:
+    if mc.right_inverse_core is None:
         raise RuntimeError(
-            "Loaded Phase 2C private key "
-            "does not contain R."
+            "Loaded key does not contain "
+            "right_inverse_core."
+        )
+
+    if mc.right_inverse_pivots is None:
+        raise RuntimeError(
+            "Loaded key does not contain "
+            "right_inverse_pivots."
         )
 
     input_arr = np.asarray(
@@ -1372,19 +1080,13 @@ def decrypt(
             "Ciphertext must be binary."
         )
 
-    # ------------------------------------------------------------
-    # Single-block decryption
-    # ------------------------------------------------------------
-
     if not block:
 
         if len(
             input_arr
         ) != n:
             raise ValueError(
-                "Single-block ciphertext must contain "
-                f"exactly {n} bits; "
-                f"received {len(input_arr)}."
+                f"Ciphertext must contain {n} bits."
             )
 
         return np.asarray(
@@ -1394,33 +1096,23 @@ def decrypt(
             dtype=np.uint8,
         ).reshape(-1)
 
-    # ------------------------------------------------------------
-    # Multi-block decryption
-    # ------------------------------------------------------------
-
-    if (
-        len(
-            input_arr
-        )
-        % n
-        != 0
-    ):
+    if len(
+        input_arr
+    ) % n != 0:
         raise ValueError(
-            "Block ciphertext length must be "
-            f"a multiple of {n}."
+            "Block ciphertext length must "
+            f"be a multiple of {n}."
         )
 
-    ciphertext_blocks = (
-        input_arr.reshape(
-            -1,
-            n,
-        )
+    blocks = input_arr.reshape(
+        -1,
+        n,
     )
 
     plaintext_blocks = []
 
     for index, block_data in enumerate(
-        ciphertext_blocks,
+        blocks,
         start=1,
     ):
 
@@ -1428,7 +1120,7 @@ def decrypt(
             "Decrypting block %d of %d",
             index,
             len(
-                ciphertext_blocks
+                blocks
             ),
         )
 
@@ -1477,16 +1169,13 @@ def decrypt(
 
 
 # ================================================================
-# CLI input handling
+# CLI input/output
 # ================================================================
 
 def read_cli_input(
     filename,
     poly_input,
 ):
-    """
-    Read binary or integer-array input from a file/stdin.
-    """
 
     if (
         filename is None
@@ -1496,14 +1185,12 @@ def read_cli_input(
 
         if poly_input:
             raw = sys.stdin.read()
-
         else:
             raw = sys.stdin.buffer.read()
 
     else:
 
         if poly_input:
-
             with open(
                 filename,
                 "r",
@@ -1512,7 +1199,6 @@ def read_cli_input(
                 raw = file.read()
 
         else:
-
             with open(
                 filename,
                 "rb",
@@ -1553,17 +1239,10 @@ def read_cli_input(
     return result
 
 
-# ================================================================
-# CLI output handling
-# ================================================================
-
 def write_cli_output(
     output,
     poly_output,
 ):
-    """
-    Write output either as an integer list or packed bytes.
-    """
 
     output = np.asarray(
         output,
@@ -1589,14 +1268,14 @@ def write_cli_output(
 
 
 # ================================================================
-# Main command-line entry point
+# Main
 # ================================================================
 
 def main():
 
     args = docopt(
         __doc__,
-        version="McEliece Phase 2C",
+        version="McEliece Phase 2D",
     )
 
     root = logging.getLogger()
@@ -1632,28 +1311,6 @@ def main():
         handler
     )
 
-    poly_input = bool(
-        args[
-            "--poly-input"
-        ]
-    )
-
-    poly_output = bool(
-        args[
-            "--poly-output"
-        ]
-    )
-
-    block = bool(
-        args[
-            "--block"
-        ]
-    )
-
-    # ------------------------------------------------------------
-    # Key generation
-    # ------------------------------------------------------------
-
     if args[
         "gen"
     ]:
@@ -1678,20 +1335,16 @@ def main():
 
         return
 
-    # ------------------------------------------------------------
-    # Read input for encryption/decryption.
-    # ------------------------------------------------------------
-
     input_arr = read_cli_input(
         args[
             "FILE"
         ],
-        poly_input,
+        bool(
+            args[
+                "--poly-input"
+            ]
+        ),
     )
-
-    # ------------------------------------------------------------
-    # Encryption
-    # ------------------------------------------------------------
 
     if args[
         "enc"
@@ -1702,12 +1355,12 @@ def main():
                 "PUB_KEY_FILE"
             ],
             input_arr,
-            block=block,
+            block=bool(
+                args[
+                    "--block"
+                ]
+            ),
         )
-
-    # ------------------------------------------------------------
-    # Decryption
-    # ------------------------------------------------------------
 
     elif args[
         "dec"
@@ -1718,7 +1371,11 @@ def main():
                 "PRIV_KEY_FILE"
             ],
             input_arr,
-            block=block,
+            block=bool(
+                args[
+                    "--block"
+                ]
+            ),
         )
 
     else:
@@ -1728,7 +1385,11 @@ def main():
 
     write_cli_output(
         output,
-        poly_output,
+        bool(
+            args[
+                "--poly-output"
+            ]
+        ),
     )
 
 
