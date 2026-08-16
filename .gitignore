@@ -104,3 +104,10 @@ ENV/
 
 # mypy
 .mypy_cache/
+# Python temporary files
+__pycache__/
+*.pyc
+
+# Local backup files
+*.bak
+*.before_matrix_fix
