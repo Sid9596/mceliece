@@ -1,65 +1,57 @@
 """
-Phase 2E detailed scaling and bottleneck profiler.
+Phase 2E.1 detailed scaling and Goppa-polynomial profiler.
 
-This experiment profiles the binary-Goppa McEliece implementation
-stage by stage.
+This experiment extends Phase 2E by decomposing
 
-Measured components
--------------------
+    _generate_goppa_polynomial()
 
-1. Extension-field, support, and Goppa-polynomial generation.
-2. Parity-check construction:
-       extension-field H
-       binary expansion H_bin
-3. Nullspace computation for the generator G.
-4. Factorized right inverse:
-       J = right_inverse_pivots
-       C = right_inverse_core
-       G[:,J] C = I_k
-5. Dense scrambling matrix:
-       generation of S
-       inversion of S
-6. Public-generator construction:
-       S G
-       column permutation
-7. Encryption.
-8. Patterson correction.
-9. Factorized information extraction:
-       c[J] C
+into its internal timing components.
+
+No cryptographic construction is changed.
+
+Measured Goppa-polynomial components
+------------------------------------
+
+1. Candidate generation:
+       irreducible_poly_ext_candidate(...)
+
+2. Cheap candidate rejection:
+       candidate(0) == 0
+       candidate(1) == 0
+
+3. Full extension-field root search:
+       first_alpha_power_root(...)
+
+4. Alpha-power representation conversion:
+       reduce_to_alpha_power(...)
+
+5. Final support-wide verification:
+       g(L_j) != 0 for every support element
+
+6. Candidate counters:
+       candidate attempts
+       cheap rejections
+       root-search calls
+       root-search rejections
+       accepted attempt
+
+The original Phase 2E measurements are retained:
+
+1.  Goppa field/support/polynomial generation.
+2.  H construction.
+3.  Nullspace computation for G.
+4.  Factorized right inverse J,C.
+5.  Dense S generation and inversion.
+6.  G_pub construction.
+7.  Encryption.
+8.  Patterson correction.
+9.  Factorized extraction c[J]C.
 10. Total decryption.
-11. Memory/storage measurements for
-       G, H, S, S_inv, G_pub, J, C.
+11. Matrix/key memory and storage.
 
-Phase 2D representation
------------------------
+Results are written incrementally to
 
-The generator right inverse is represented by
-
-    J = right_inverse_pivots
-
-and
-
-    C = right_inverse_core = (G[:,J])^{-1}.
-
-The full n x k right inverse R is never required.
-
-For a clean codeword
-
-    c = a G,
-
-we recover
-
-    a = c[J] C.
-
-Output
-------
-
-Results are appended incrementally to
-
-    phase2e_scaling_results.csv
-
-so successful smaller parameter sets are preserved even if a larger
-parameter set fails or is interrupted.
+    phase2e1_goppa_profile_results.csv.
 """
 
 import argparse
@@ -75,8 +67,16 @@ import traceback
 
 import numpy as np
 
-from goppa.goppacodegenerator import GoppaCodeGenerator
-from mceliece.mceliececipher import McElieceCipher
+from sympy.abc import alpha
+
+from goppa.goppacodegenerator import (
+    GoppaCodeGenerator,
+)
+
+from mceliece.mceliececipher import (
+    McElieceCipher,
+)
+
 from mceliece.mathutils import (
     GF2Matrix,
     get_binary_from_alpha,
@@ -97,7 +97,9 @@ PARAMETER_SETS = [
 ]
 
 
-DEFAULT_CSV = "phase2e_scaling_results.csv"
+DEFAULT_CSV = (
+    "phase2e1_goppa_profile_results.csv"
+)
 
 BASE_SEED = 20260816
 
@@ -107,7 +109,10 @@ BASE_SEED = 20260816
 # ======================================================================
 
 CSV_FIELDS = [
+    # ------------------------------------------------------------
     # Run information
+    # ------------------------------------------------------------
+
     "run_time",
     "parameter_index",
     "status",
@@ -115,7 +120,10 @@ CSV_FIELDS = [
     "error_message",
     "seed",
 
+    # ------------------------------------------------------------
     # Parameters
+    # ------------------------------------------------------------
+
     "m",
     "n",
     "t",
@@ -124,44 +132,111 @@ CSV_FIELDS = [
     "dimension_lower_bound",
     "rate",
 
-    # Stage 1
+    # ------------------------------------------------------------
+    # Stage 1: field/support/Goppa polynomial
+    # ------------------------------------------------------------
+
     "field_generation_sec",
     "support_generation_sec",
+
     "goppa_polynomial_sec",
+
+    # Phase 2E.1 subprofile
+    "goppa_candidate_attempts",
+    "goppa_candidate_accepted_attempt",
+
+    "goppa_candidate_generation_sec",
+
+    "goppa_cheap_rejection_sec",
+    "goppa_cheap_rejections",
+
+    "goppa_first_root_sec",
+    "goppa_first_root_calls",
+    "goppa_first_root_rejections",
+    "goppa_first_root_avg_sec",
+    "goppa_first_root_max_sec",
+
+    "goppa_candidate_loop_sec",
+
+    "goppa_reduce_to_alpha_power_sec",
+    "goppa_degree_check_sec",
+
+    "goppa_final_support_verification_sec",
+    "goppa_final_support_points",
+
+    "goppa_profile_total_sec",
+
+    # Difference between externally timed method and accounted
+    # profiler total/subcomponents.
+    "goppa_external_minus_profile_sec",
+
+    # Component percentages of externally measured
+    # goppa_polynomial_sec.
+    "goppa_candidate_generation_pct",
+    "goppa_cheap_rejection_pct",
+    "goppa_first_root_pct",
+    "goppa_reduce_to_alpha_power_pct",
+    "goppa_final_support_verification_pct",
+
+    # Remaining Stage 1 measurements
     "goppa_storage_conversion_sec",
     "goppa_support_total_sec",
 
-    # Stage 2
+    # ------------------------------------------------------------
+    # Stage 2: H
+    # ------------------------------------------------------------
+
     "H_extension_sec",
     "H_binary_expansion_sec",
     "H_total_sec",
 
-    # Stage 3
+    # ------------------------------------------------------------
+    # Stage 3: G
+    # ------------------------------------------------------------
+
     "nullspace_sec",
     "generator_finalize_sec",
     "generator_total_sec",
     "rank_H",
 
-    # Stage 4
+    # ------------------------------------------------------------
+    # Stage 4: J,C
+    # ------------------------------------------------------------
+
     "right_inverse_factorization_sec",
 
-    # Stage 5
+    # ------------------------------------------------------------
+    # Stage 5: S
+    # ------------------------------------------------------------
+
     "S_generation_sec",
     "S_inversion_sec",
     "S_total_sec",
 
-    # Additional permutation timing
+    # ------------------------------------------------------------
+    # Permutation
+    # ------------------------------------------------------------
+
     "permutation_generation_sec",
 
-    # Stage 6
+    # ------------------------------------------------------------
+    # Stage 6: G_pub
+    # ------------------------------------------------------------
+
     "SG_multiplication_sec",
     "Gpub_permutation_sec",
     "Gpub_total_sec",
 
+    # ------------------------------------------------------------
     # Total construction
+    # ------------------------------------------------------------
+
     "construction_wall_sec",
 
+    # ------------------------------------------------------------
     # Stages 7-10
+    # ------------------------------------------------------------
+
     "encryption_avg_sec",
     "encryption_min_sec",
     "encryption_max_sec",
@@ -185,7 +260,10 @@ CSV_FIELDS = [
     "trials",
     "successful_trials",
 
+    # ------------------------------------------------------------
     # Matrix dimensions
+    # ------------------------------------------------------------
+
     "G_rows",
     "G_cols",
     "H_rows",
@@ -200,7 +278,10 @@ CSV_FIELDS = [
     "C_rows",
     "C_cols",
 
-    # Logical binary storage
+    # ------------------------------------------------------------
+    # Logical bit-packed storage
+    # ------------------------------------------------------------
+
     "G_logical_packed_bytes",
     "H_logical_packed_bytes",
     "S_logical_packed_bytes",
@@ -208,7 +289,10 @@ CSV_FIELDS = [
     "Gpub_logical_packed_bytes",
     "C_logical_packed_bytes",
 
+    # ------------------------------------------------------------
     # uint8 serialized storage
+    # ------------------------------------------------------------
+
     "G_uint8_bytes",
     "H_uint8_bytes",
     "S_uint8_bytes",
@@ -217,7 +301,10 @@ CSV_FIELDS = [
     "C_uint8_bytes",
     "J_int64_bytes",
 
-    # NumPy object-array pointer buffers
+    # ------------------------------------------------------------
+    # NumPy object-array buffers
+    # ------------------------------------------------------------
+
     "G_object_buffer_bytes",
     "H_object_buffer_bytes",
     "S_object_buffer_bytes",
@@ -225,7 +312,10 @@ CSV_FIELDS = [
     "Gpub_object_buffer_bytes",
     "C_object_buffer_bytes",
 
-    # Approximate resident memory of GF2 object representation
+    # ------------------------------------------------------------
+    # Approximate Python representation
+    # ------------------------------------------------------------
+
     "G_estimated_python_bytes",
     "H_estimated_python_bytes",
     "S_estimated_python_bytes",
@@ -233,17 +323,26 @@ CSV_FIELDS = [
     "Gpub_estimated_python_bytes",
     "C_estimated_python_bytes",
 
+    # ------------------------------------------------------------
     # Aggregate storage
+    # ------------------------------------------------------------
+
     "total_binary_packed_bytes",
     "total_uint8_plus_J_bytes",
     "total_object_buffer_plus_J_bytes",
     "total_estimated_python_plus_J_bytes",
 
+    # ------------------------------------------------------------
     # Actual compressed NPZ sizes
+    # ------------------------------------------------------------
+
     "private_npz_bytes",
     "public_npz_bytes",
 
+    # ------------------------------------------------------------
     # Process memory diagnostics
+    # ------------------------------------------------------------
+
     "rss_after_goppa_mib",
     "rss_after_H_mib",
     "rss_after_G_mib",
@@ -254,7 +353,10 @@ CSV_FIELDS = [
     "rss_after_trials_mib",
     "peak_rss_mib",
 
+    # ------------------------------------------------------------
     # Correctness
+    # ------------------------------------------------------------
+
     "GHt_zero",
     "right_inverse_identity",
     "scrambling_inverse_identity",
@@ -266,7 +368,7 @@ CSV_FIELDS = [
 
 
 # ======================================================================
-# Basic helpers
+# Generic helpers
 # ======================================================================
 
 def now_string():
@@ -275,13 +377,21 @@ def now_string():
     )
 
 
-def seconds_since(start):
-    return time.perf_counter() - start
+def seconds_since(
+    start,
+):
+    return (
+        time.perf_counter()
+        -
+        start
+    )
 
 
-def gf2_numpy(matrix):
+def gf2_numpy(
+    matrix,
+):
     """
-    Convert GF2Matrix to a uint8 NumPy array while preserving shape.
+    Convert GF2Matrix to uint8 while retaining shape.
     """
 
     if not isinstance(
@@ -295,7 +405,11 @@ def gf2_numpy(matrix):
     return np.array(
         [
             int(x.n)
-            for x in matrix.arr.flat
+            for x in (
+                matrix
+                .arr
+                .flat
+            )
         ],
         dtype=np.uint8,
     ).reshape(
@@ -303,37 +417,58 @@ def gf2_numpy(matrix):
     )
 
 
-def matrix_equal(A, B):
-    if A.arr.shape != B.arr.shape:
+def matrix_equal(
+    A,
+    B,
+):
+    if (
+        A.arr.shape
+        !=
+        B.arr.shape
+    ):
         return False
 
     return np.array_equal(
-        gf2_numpy(A),
-        gf2_numpy(B),
+        gf2_numpy(
+            A
+        ),
+        gf2_numpy(
+            B
+        ),
     )
 
 
-def matrix_is_zero(M):
+def matrix_is_zero(
+    matrix,
+):
     return not np.any(
-        gf2_numpy(M)
+        gf2_numpy(
+            matrix
+        )
     )
 
 
-def gf2_identity(k):
+def gf2_identity(
+    size,
+):
     return GF2Matrix.from_list(
         np.eye(
-            k,
+            size,
             dtype=np.uint8,
         )
     )
 
 
-def vector_equal(A, B):
+def vector_equal(
+    A,
+    B,
+):
     return np.array_equal(
         np.asarray(
             A,
             dtype=np.uint8,
         ).reshape(-1),
+
         np.asarray(
             B,
             dtype=np.uint8,
@@ -341,13 +476,9 @@ def vector_equal(A, B):
     )
 
 
-def timing_stats(values):
-    """
-    Return avg, min, max.
-
-    Empty input returns NaN.
-    """
-
+def timing_stats(
+    values,
+):
     if not values:
         return (
             float("nan"),
@@ -356,9 +487,47 @@ def timing_stats(values):
         )
 
     return (
-        float(np.mean(values)),
-        float(np.min(values)),
-        float(np.max(values)),
+        float(
+            np.mean(
+                values
+            )
+        ),
+        float(
+            np.min(
+                values
+            )
+        ),
+        float(
+            np.max(
+                values
+            )
+        ),
+    )
+
+
+def percentage(
+    component,
+    total,
+):
+    if (
+        total is None
+        or
+        total <= 0
+    ):
+        return float(
+            "nan"
+        )
+
+    return (
+        100.0
+        *
+        float(
+            component
+        )
+        /
+        float(
+            total
+        )
     )
 
 
@@ -368,9 +537,7 @@ def timing_stats(values):
 
 def current_rss_mib():
     """
-    Current resident-set size on Linux using /proc/self/status.
-
-    Returns NaN on unsupported platforms.
+    Current Linux resident-set size.
     """
 
     try:
@@ -379,6 +546,7 @@ def current_rss_mib():
             "r",
             encoding="utf-8",
         ) as file:
+
             for line in file:
                 if line.startswith(
                     "VmRSS:"
@@ -388,72 +556,81 @@ def current_rss_mib():
                     )
 
                     return (
-                        kb / 1024.0
+                        kb
+                        /
+                        1024.0
                     )
 
     except Exception:
         pass
 
-    return float("nan")
+    return float(
+        "nan"
+    )
 
 
 def peak_rss_mib():
     """
-    Process peak resident memory.
+    Peak process resident memory.
 
-    On Linux ru_maxrss is reported in KiB.
+    Linux reports ru_maxrss in KiB.
     """
 
     try:
-        usage = resource.getrusage(
-            resource.RUSAGE_SELF
+        usage = (
+            resource
+            .getrusage(
+                resource.RUSAGE_SELF
+            )
         )
 
         return (
             float(
                 usage.ru_maxrss
             )
-            / 1024.0
+            /
+            1024.0
         )
 
     except Exception:
-        return float("nan")
+        return float(
+            "nan"
+        )
 
 
 # ======================================================================
-# Matrix storage measurements
+# Matrix memory measurements
 # ======================================================================
 
-def logical_packed_bytes(entries):
-    """
-    Minimum byte count required to bit-pack `entries` binary values.
-    """
-
+def logical_packed_bytes(
+    entries,
+):
     return (
-        int(entries) + 7
+        int(
+            entries
+        )
+        +
+        7
     ) // 8
 
 
-def matrix_memory_stats(matrix):
+def matrix_memory_stats(
+    matrix,
+):
     """
-    Return several views of GF2Matrix storage.
+    Measure several representations of a GF2Matrix.
 
-    logical_packed_bytes:
-        theoretical bit-packed representation.
+    packed:
+        theoretical bit-packed size.
 
-    uint8_bytes:
-        storage if each binary coefficient is serialized as uint8.
+    uint8:
+        one byte per bit.
 
-    object_buffer_bytes:
-        NumPy object-array pointer buffer only. This does not include
-        the GF2 objects pointed to by the array.
+    object_buffer:
+        NumPy object-array pointer storage only.
 
-    estimated_python_bytes:
-        object-buffer bytes plus sys.getsizeof() for one GF2 object
-        per matrix entry.
-
-        This remains an estimate; Python allocator overhead is not
-        included.
+    estimated_python:
+        pointer storage plus sys.getsizeof() for each GF2 object.
     """
 
     if not isinstance(
@@ -461,7 +638,8 @@ def matrix_memory_stats(matrix):
         GF2Matrix,
     ):
         raise TypeError(
-            "matrix_memory_stats expects GF2Matrix."
+            "matrix_memory_stats expects "
+            "GF2Matrix."
         )
 
     entries = int(
@@ -472,28 +650,37 @@ def matrix_memory_stats(matrix):
         matrix.arr.nbytes
     )
 
-    if entries > 0:
+    if entries:
         one_object_size = int(
             sys.getsizeof(
-                matrix.arr.flat[0]
+                matrix
+                .arr
+                .flat[0]
             )
         )
+
     else:
         one_object_size = 0
 
     estimated_python = (
         pointer_buffer
         +
-        entries * one_object_size
+        entries
+        *
+        one_object_size
     )
 
     return {
         "entries": entries,
-        "packed": logical_packed_bytes(
-            entries
+        "packed": (
+            logical_packed_bytes(
+                entries
+            )
         ),
         "uint8": entries,
-        "object_buffer": pointer_buffer,
+        "object_buffer": (
+            pointer_buffer
+        ),
         "estimated_python": (
             estimated_python
         ),
@@ -505,11 +692,17 @@ def record_matrix_stats(
     prefix,
     matrix,
 ):
-    stats = matrix_memory_stats(
-        matrix
+    stats = (
+        matrix_memory_stats(
+            matrix
+        )
     )
 
-    shape = matrix.arr.shape
+    shape = (
+        matrix
+        .arr
+        .shape
+    )
 
     row[
         f"{prefix}_rows"
@@ -551,7 +744,7 @@ def record_matrix_stats(
 
 
 # ======================================================================
-# Incremental CSV writer
+# CSV
 # ======================================================================
 
 def append_csv_row(
@@ -565,7 +758,9 @@ def append_csv_row(
     file_exists = (
         csv_path.exists()
         and
-        csv_path.stat().st_size > 0
+        csv_path.stat().st_size
+        >
+        0
     )
 
     with open(
@@ -588,7 +783,8 @@ def append_csv_row(
                 field,
                 ""
             )
-            for field in CSV_FIELDS
+            for field
+            in CSV_FIELDS
         }
 
         writer.writerow(
@@ -603,28 +799,25 @@ def append_csv_row(
 
 
 # ======================================================================
-# Goppa-polynomial primitive storage conversion
+# Polynomial-storage conversion
 # ======================================================================
 
 def convert_polynomials_for_cipher(
     g_poly,
     irr_poly,
 ):
-    """
-    Convert the SymPy extension-field polynomial representation to
-    the primitive arrays used by McElieceCipher.
-    """
-
     g_coeffs = []
 
     for coefficient in (
         g_poly
         .all_coeffs()[::-1]
     ):
-        bits = get_binary_from_alpha(
-            coefficient,
-            irr_poly,
-            2,
+        bits = (
+            get_binary_from_alpha(
+                coefficient,
+                irr_poly,
+                2,
+            )
         )
 
         g_coeffs.append(
@@ -642,9 +835,10 @@ def convert_polynomials_for_cipher(
     irr_storage = np.asarray(
         [
             int(c) % 2
-            for c
-            in irr_poly
-            .all_coeffs()[::-1]
+            for c in (
+                irr_poly
+                .all_coeffs()[::-1]
+            )
         ],
         dtype=np.uint8,
     )
@@ -656,7 +850,7 @@ def convert_polynomials_for_cipher(
 
 
 # ======================================================================
-# Actual compressed storage measurement
+# NPZ-size measurement
 # ======================================================================
 
 def measure_npz_sizes(
@@ -665,12 +859,11 @@ def measure_npz_sizes(
     irr_storage,
 ):
     """
-    Measure actual compressed Phase-2D-style NPZ sizes without
-    regenerating the key.
+    Measure actual compressed Phase-2D key representation.
     """
 
     with tempfile.TemporaryDirectory(
-        prefix="phase2e_storage_"
+        prefix="phase2e1_storage_"
     ) as temp_dir:
 
         temp_dir = Path(
@@ -679,16 +872,23 @@ def measure_npz_sizes(
 
         private_path = (
             temp_dir
-            / "private.npz"
+            /
+            "private.npz"
         )
 
         public_path = (
             temp_dir
-            / "public.npz"
+            /
+            "public.npz"
         )
 
         np.savez_compressed(
             private_path,
+
+            format_version=np.asarray(
+                4,
+                dtype=np.int64,
+            ),
 
             m=np.asarray(
                 mc.m,
@@ -718,17 +918,13 @@ def measure_npz_sizes(
                 mc.H
             ),
 
-            right_inverse_pivots=(
-                np.asarray(
-                    mc.right_inverse_pivots,
-                    dtype=np.int64,
-                )
+            right_inverse_pivots=np.asarray(
+                mc.right_inverse_pivots,
+                dtype=np.int64,
             ),
 
-            right_inverse_core=(
-                gf2_numpy(
-                    mc.right_inverse_core
-                )
+            right_inverse_core=gf2_numpy(
+                mc.right_inverse_core
             ),
 
             S=gf2_numpy(
@@ -763,6 +959,11 @@ def measure_npz_sizes(
         np.savez_compressed(
             public_path,
 
+            format_version=np.asarray(
+                4,
+                dtype=np.int64,
+            ),
+
             m=np.asarray(
                 mc.m,
                 dtype=np.int64,
@@ -790,16 +991,246 @@ def measure_npz_sizes(
 
         return (
             int(
-                private_path.stat().st_size
+                private_path
+                .stat()
+                .st_size
             ),
             int(
-                public_path.stat().st_size
+                public_path
+                .stat()
+                .st_size
             ),
         )
 
 
 # ======================================================================
-# Parameter-set profiler
+# Goppa-profile transfer
+# ======================================================================
+
+def copy_goppa_profile_to_row(
+    row,
+    profile,
+    external_total,
+):
+    """
+    Copy GoppaCodeGenerator.goppa_profile into the CSV row.
+    """
+
+    row[
+        "goppa_candidate_attempts"
+    ] = int(
+        profile.get(
+            "candidate_attempts",
+            0,
+        )
+    )
+
+    row[
+        "goppa_candidate_accepted_attempt"
+    ] = int(
+        profile.get(
+            "candidate_accepted_attempt",
+            0,
+        )
+    )
+
+    row[
+        "goppa_candidate_generation_sec"
+    ] = float(
+        profile.get(
+            "candidate_generation_sec",
+            0.0,
+        )
+    )
+
+    row[
+        "goppa_cheap_rejection_sec"
+    ] = float(
+        profile.get(
+            "cheap_rejection_sec",
+            0.0,
+        )
+    )
+
+    row[
+        "goppa_cheap_rejections"
+    ] = int(
+        profile.get(
+            "cheap_rejections",
+            0,
+        )
+    )
+
+    row[
+        "goppa_first_root_sec"
+    ] = float(
+        profile.get(
+            "first_alpha_power_root_sec",
+            0.0,
+        )
+    )
+
+    row[
+        "goppa_first_root_calls"
+    ] = int(
+        profile.get(
+            "first_alpha_power_root_calls",
+            0,
+        )
+    )
+
+    row[
+        "goppa_first_root_rejections"
+    ] = int(
+        profile.get(
+            "first_alpha_power_root_rejections",
+            0,
+        )
+    )
+
+    row[
+        "goppa_first_root_max_sec"
+    ] = float(
+        profile.get(
+            "first_alpha_power_root_max_sec",
+            0.0,
+        )
+    )
+
+    root_calls = row[
+        "goppa_first_root_calls"
+    ]
+
+    if root_calls:
+        row[
+            "goppa_first_root_avg_sec"
+        ] = (
+            row[
+                "goppa_first_root_sec"
+            ]
+            /
+            root_calls
+        )
+
+    else:
+        row[
+            "goppa_first_root_avg_sec"
+        ] = 0.0
+
+    row[
+        "goppa_candidate_loop_sec"
+    ] = float(
+        profile.get(
+            "candidate_loop_sec",
+            0.0,
+        )
+    )
+
+    row[
+        "goppa_reduce_to_alpha_power_sec"
+    ] = float(
+        profile.get(
+            "reduce_to_alpha_power_sec",
+            0.0,
+        )
+    )
+
+    row[
+        "goppa_degree_check_sec"
+    ] = float(
+        profile.get(
+            "degree_check_sec",
+            0.0,
+        )
+    )
+
+    row[
+        "goppa_final_support_verification_sec"
+    ] = float(
+        profile.get(
+            "final_support_verification_sec",
+            0.0,
+        )
+    )
+
+    row[
+        "goppa_final_support_points"
+    ] = int(
+        profile.get(
+            "final_support_points",
+            0,
+        )
+    )
+
+    row[
+        "goppa_profile_total_sec"
+    ] = float(
+        profile.get(
+            "total_sec",
+            0.0,
+        )
+    )
+
+    row[
+        "goppa_external_minus_profile_sec"
+    ] = (
+        float(
+            external_total
+        )
+        -
+        row[
+            "goppa_profile_total_sec"
+        ]
+    )
+
+    row[
+        "goppa_candidate_generation_pct"
+    ] = percentage(
+        row[
+            "goppa_candidate_generation_sec"
+        ],
+        external_total,
+    )
+
+    row[
+        "goppa_cheap_rejection_pct"
+    ] = percentage(
+        row[
+            "goppa_cheap_rejection_sec"
+        ],
+        external_total,
+    )
+
+    row[
+        "goppa_first_root_pct"
+    ] = percentage(
+        row[
+            "goppa_first_root_sec"
+        ],
+        external_total,
+    )
+
+    row[
+        "goppa_reduce_to_alpha_power_pct"
+    ] = percentage(
+        row[
+            "goppa_reduce_to_alpha_power_sec"
+        ],
+        external_total,
+    )
+
+    row[
+        "goppa_final_support_verification_pct"
+    ] = percentage(
+        row[
+            "goppa_final_support_verification_sec"
+        ],
+        external_total,
+    )
+
+
+# ======================================================================
+# Profile one parameter set
 # ======================================================================
 
 def profile_parameter_set(
@@ -810,42 +1241,53 @@ def profile_parameter_set(
     trials,
     seed,
 ):
-    """
-    Profile one parameter set.
-
-    Results are returned as a dictionary suitable for CSV output.
-    """
-
     row = {
-        "run_time": now_string(),
-        "parameter_index": index,
-        "status": "RUNNING",
+        "run_time": (
+            now_string()
+        ),
+        "parameter_index": (
+            index
+        ),
+        "status": (
+            "RUNNING"
+        ),
         "error_stage": "",
         "error_message": "",
         "seed": seed,
+
         "m": m,
         "n": n,
         "t": t,
-        "mt": m * t,
+        "mt": (
+            m * t
+        ),
         "dimension_lower_bound": (
-            n - m * t
+            n
+            -
+            m * t
         ),
         "trials": trials,
     }
 
-    stage = "initialization"
+    stage = (
+        "initialization"
+    )
 
     print()
-    print("=" * 88)
+    print(
+        "=" * 96
+    )
 
     print(
-        f"PHASE 2E PROFILE "
+        "PHASE 2E.1 PROFILE "
         f"index={index}: "
         f"m={m}, n={n}, t={t}, "
         f"trials={trials}"
     )
 
-    print("=" * 88)
+    print(
+        "=" * 96
+    )
 
     np.random.seed(
         seed
@@ -857,10 +1299,12 @@ def profile_parameter_set(
 
     try:
         # ==========================================================
-        # 1. Field, support, Goppa polynomial
+        # 1a. Extension field
         # ==========================================================
 
-        stage = "field_generation"
+        stage = (
+            "field_generation"
+        )
 
         generator = (
             GoppaCodeGenerator(
@@ -870,7 +1314,9 @@ def profile_parameter_set(
             )
         )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         (
             irr_poly,
@@ -896,13 +1342,17 @@ def profile_parameter_set(
             f"{row['field_generation_sec']:.6f} s"
         )
 
-        # ----------------------------------------------------------
-        # Support
-        # ----------------------------------------------------------
+        # ==========================================================
+        # 1b. Support
+        # ==========================================================
 
-        stage = "support_generation"
+        stage = (
+            "support_generation"
+        )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         support_exponents = list(
             range(
@@ -911,23 +1361,15 @@ def profile_parameter_set(
         )
 
         support = [
-            generator.support_exponents
-            for _ in []
-        ]
-
-        # Explicit support used by the current implementation.
-        support = [
-            exponent
-            for exponent in support_exponents
+            alpha ** exponent
+            for exponent
+            in support_exponents
         ]
 
         generator.support_exponents = (
             support_exponents
         )
 
-        # The actual generator stores symbolic alpha powers.
-        # We do not need a second symbolic list for the profiler;
-        # support_exponents completely specifies the current support.
         generator.support = (
             support
         )
@@ -944,7 +1386,8 @@ def profile_parameter_set(
         )
 
         print(
-            f"  length = {len(support_exponents)}"
+            f"  length = "
+            f"{len(support)}"
         )
 
         print(
@@ -952,13 +1395,17 @@ def profile_parameter_set(
             f"{row['support_generation_sec']:.6f} s"
         )
 
-        # ----------------------------------------------------------
-        # Goppa polynomial
-        # ----------------------------------------------------------
+        # ==========================================================
+        # 1c. Goppa polynomial
+        # ==========================================================
 
-        stage = "goppa_polynomial"
+        stage = (
+            "goppa_polynomial"
+        )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         g_poly = (
             generator
@@ -975,27 +1422,128 @@ def profile_parameter_set(
             start
         )
 
+        copy_goppa_profile_to_row(
+            row,
+            generator.goppa_profile,
+            row[
+                "goppa_polynomial_sec"
+            ],
+        )
+
         print()
         print(
             "[1c] Goppa polynomial"
         )
 
         print(
-            f"  degree = {g_poly.degree()}"
+            f"  degree = "
+            f"{g_poly.degree()}"
         )
 
         print(
-            "  time   = "
+            "  total external time     = "
             f"{row['goppa_polynomial_sec']:.6f} s"
         )
 
-        # ----------------------------------------------------------
-        # Primitive storage conversion used by McElieceCipher.
-        # ----------------------------------------------------------
+        print()
+        print(
+            "  Phase 2E.1 subprofile:"
+        )
 
-        stage = "goppa_storage_conversion"
+        print(
+            "    candidate attempts    = "
+            f"{row['goppa_candidate_attempts']}"
+        )
 
-        start = time.perf_counter()
+        print(
+            "    accepted attempt      = "
+            f"{row['goppa_candidate_accepted_attempt']}"
+        )
+
+        print(
+            "    candidate generation  = "
+            f"{row['goppa_candidate_generation_sec']:.6f} s "
+            f"("
+            f"{row['goppa_candidate_generation_pct']:.2f}%"
+            f")"
+        )
+
+        print(
+            "    cheap rejection       = "
+            f"{row['goppa_cheap_rejection_sec']:.6f} s "
+            f"("
+            f"{row['goppa_cheap_rejections']} rejects, "
+            f"{row['goppa_cheap_rejection_pct']:.2f}%"
+            f")"
+        )
+
+        print(
+            "    first-root search     = "
+            f"{row['goppa_first_root_sec']:.6f} s "
+            f"("
+            f"{row['goppa_first_root_calls']} calls, "
+            f"{row['goppa_first_root_pct']:.2f}%"
+            f")"
+        )
+
+        print(
+            "    root-search average   = "
+            f"{row['goppa_first_root_avg_sec']:.6f} s"
+        )
+
+        print(
+            "    root-search maximum   = "
+            f"{row['goppa_first_root_max_sec']:.6f} s"
+        )
+
+        print(
+            "    root rejections       = "
+            f"{row['goppa_first_root_rejections']}"
+        )
+
+        print(
+            "    candidate loop total  = "
+            f"{row['goppa_candidate_loop_sec']:.6f} s"
+        )
+
+        print(
+            "    alpha-power reduction = "
+            f"{row['goppa_reduce_to_alpha_power_sec']:.6f} s "
+            f"("
+            f"{row['goppa_reduce_to_alpha_power_pct']:.2f}%"
+            f")"
+        )
+
+        print(
+            "    support verification  = "
+            f"{row['goppa_final_support_verification_sec']:.6f} s "
+            f"("
+            f"{row['goppa_final_support_points']} points, "
+            f"{row['goppa_final_support_verification_pct']:.2f}%"
+            f")"
+        )
+
+        print(
+            "    internal profile      = "
+            f"{row['goppa_profile_total_sec']:.6f} s"
+        )
+
+        print(
+            "    external-profile diff = "
+            f"{row['goppa_external_minus_profile_sec']:.6f} s"
+        )
+
+        # ==========================================================
+        # Primitive storage conversion
+        # ==========================================================
+
+        stage = (
+            "goppa_storage_conversion"
+        )
+
+        start = (
+            time.perf_counter()
+        )
 
         (
             g_storage,
@@ -1041,14 +1589,18 @@ def profile_parameter_set(
         # 2. H construction
         # ==========================================================
 
-        stage = "H_extension"
+        stage = (
+            "H_extension"
+        )
 
         print()
         print(
             "[2] Parity-check construction"
         )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         H_ext = (
             generator
@@ -1066,14 +1618,13 @@ def profile_parameter_set(
             start
         )
 
-        print(
-            "  extension H = "
-            f"{row['H_extension_sec']:.6f} s"
+        stage = (
+            "H_binary_expansion"
         )
 
-        stage = "H_binary_expansion"
-
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         H = (
             generator
@@ -1102,6 +1653,11 @@ def profile_parameter_set(
         )
 
         print(
+            "  extension H     = "
+            f"{row['H_extension_sec']:.6f} s"
+        )
+
+        print(
             "  binary expansion = "
             f"{row['H_binary_expansion_sec']:.6f} s"
         )
@@ -1112,7 +1668,7 @@ def profile_parameter_set(
         )
 
         print(
-            "  H shape          = "
+            f"  H shape          = "
             f"{H.arr.shape}"
         )
 
@@ -1120,7 +1676,6 @@ def profile_parameter_set(
             "rss_after_H_mib"
         ] = current_rss_mib()
 
-        # H_ext is no longer needed.
         del H_ext
 
         gc.collect()
@@ -1129,14 +1684,18 @@ def profile_parameter_set(
         # 3. Nullspace -> G
         # ==========================================================
 
-        stage = "nullspace"
+        stage = (
+            "nullspace"
+        )
 
         print()
         print(
             "[3] Nullspace / generator"
         )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         (
             H_nullspace,
@@ -1149,12 +1708,17 @@ def profile_parameter_set(
             start
         )
 
-        stage = "generator_finalize"
+        stage = (
+            "generator_finalize"
+        )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         G = GF2Matrix(
-            H_nullspace.T()[
+            H_nullspace
+            .T()[
                 :nullity
             ]
         )
@@ -1204,27 +1768,30 @@ def profile_parameter_set(
         )
 
         print(
-            "  nullspace          = "
+            "  nullspace           = "
             f"{row['nullspace_sec']:.6f} s"
         )
 
         print(
-            "  generator finalize = "
+            "  generator finalize  = "
             f"{row['generator_finalize_sec']:.6f} s"
         )
 
         print(
-            f"  G shape            = {G.arr.shape}"
+            f"  G shape             = "
+            f"{G.arr.shape}"
         )
 
-        # Verify G H^T = 0.
         GHt = (
             G
-            * H.T()
+            *
+            H.T()
         )
 
-        GHt_zero = matrix_is_zero(
-            GHt
+        GHt_zero = (
+            matrix_is_zero(
+                GHt
+            )
         )
 
         row[
@@ -1246,7 +1813,7 @@ def profile_parameter_set(
         ] = current_rss_mib()
 
         # ==========================================================
-        # Build the McElieceCipher object from the measured pieces.
+        # Assemble McEliece object from profiled components
         # ==========================================================
 
         mc = McElieceCipher(
@@ -1268,17 +1835,21 @@ def profile_parameter_set(
         )
 
         # ==========================================================
-        # 4. Factorized right inverse J,C
+        # 4. Factorized right inverse
         # ==========================================================
 
-        stage = "right_inverse_factorization"
+        stage = (
+            "right_inverse_factorization"
+        )
 
         print()
         print(
             "[4] Factorized right inverse"
         )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         (
             mc.right_inverse_pivots,
@@ -1310,28 +1881,32 @@ def profile_parameter_set(
             ]
         )
 
-        JC_identity = matrix_equal(
-            B * C,
-            gf2_identity(
-                k
-            ),
+        right_inverse_ok = (
+            matrix_equal(
+                B * C,
+                gf2_identity(
+                    k
+                ),
+            )
         )
 
         row[
             "right_inverse_identity"
-        ] = JC_identity
+        ] = right_inverse_ok
 
-        if not JC_identity:
+        if not right_inverse_ok:
             raise RuntimeError(
                 "G[:,J] C != I_k."
             )
 
         print(
-            f"  J shape = {J.shape}"
+            f"  J shape = "
+            f"{J.shape}"
         )
 
         print(
-            f"  C shape = {C.arr.shape}"
+            f"  C shape = "
+            f"{C.arr.shape}"
         )
 
         print(
@@ -1348,24 +1923,32 @@ def profile_parameter_set(
         ] = current_rss_mib()
 
         # ==========================================================
-        # 5. S generation and inversion
+        # 5. Dense S
         # ==========================================================
 
-        stage = "S_generation"
+        stage = (
+            "S_generation"
+        )
 
         print()
         print(
             "[5] Dense scrambling matrix S"
         )
 
-        start = time.perf_counter()
-
-        S_numpy = random_inv_matrix(
-            k
+        start = (
+            time.perf_counter()
         )
 
-        mc.S = GF2Matrix.from_list(
-            S_numpy
+        S_numpy = (
+            random_inv_matrix(
+                k
+            )
+        )
+
+        mc.S = (
+            GF2Matrix.from_list(
+                S_numpy
+            )
         )
 
         row[
@@ -1378,9 +1961,13 @@ def profile_parameter_set(
 
         gc.collect()
 
-        stage = "S_inversion"
+        stage = (
+            "S_inversion"
+        )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         mc.S_inv = (
             mc.S.inv()
@@ -1404,18 +1991,23 @@ def profile_parameter_set(
             ]
         )
 
-        S_inverse_ok = matrix_equal(
-            mc.S * mc.S_inv,
-            gf2_identity(
-                k
-            ),
+        scrambling_ok = (
+            matrix_equal(
+                mc.S
+                *
+                mc.S_inv,
+
+                gf2_identity(
+                    k
+                ),
+            )
         )
 
         row[
             "scrambling_inverse_identity"
-        ] = S_inverse_ok
+        ] = scrambling_ok
 
-        if not S_inverse_ok:
+        if not scrambling_ok:
             raise RuntimeError(
                 "S S_inv != I_k."
             )
@@ -1443,20 +2035,31 @@ def profile_parameter_set(
         # Permutation
         # ==========================================================
 
-        stage = "permutation_generation"
-
-        start = time.perf_counter()
-
-        mc.P = np.random.permutation(
-            n
-        ).astype(
-            np.int64
+        stage = (
+            "permutation_generation"
         )
 
-        mc.P_inv = np.argsort(
-            mc.P
-        ).astype(
-            np.int64
+        start = (
+            time.perf_counter()
+        )
+
+        mc.P = (
+            np.random
+            .permutation(
+                n
+            )
+            .astype(
+                np.int64
+            )
+        )
+
+        mc.P_inv = (
+            np.argsort(
+                mc.P
+            )
+            .astype(
+                np.int64
+            )
         )
 
         row[
@@ -1465,9 +2068,11 @@ def profile_parameter_set(
             start
         )
 
-        identity_positions = np.arange(
-            n,
-            dtype=np.int64,
+        identity_positions = (
+            np.arange(
+                n,
+                dtype=np.int64,
+            )
         )
 
         if not np.array_equal(
@@ -1477,25 +2082,30 @@ def profile_parameter_set(
             identity_positions,
         ):
             raise RuntimeError(
-                "Permutation inverse is invalid."
+                "Permutation inverse failed."
             )
 
         # ==========================================================
-        # 6. G_pub
+        # 6. Public generator
         # ==========================================================
 
-        stage = "SG_multiplication"
+        stage = (
+            "SG_multiplication"
+        )
 
         print()
         print(
             "[6] Public generator"
         )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         SG = (
             mc.S
-            * mc.G
+            *
+            mc.G
         )
 
         row[
@@ -1504,12 +2114,17 @@ def profile_parameter_set(
             start
         )
 
-        stage = "Gpub_permutation"
+        stage = (
+            "Gpub_permutation"
+        )
 
-        start = time.perf_counter()
+        start = (
+            time.perf_counter()
+        )
 
         mc.Gp = (
-            mc._permute_columns(
+            mc
+            ._permute_columns(
                 SG,
                 mc.P,
             )
@@ -1540,22 +2155,24 @@ def profile_parameter_set(
             ]
         )
 
-        Gpub_ok = matrix_equal(
-            expected_Gp,
-            mc.Gp,
+        public_generator_ok = (
+            matrix_equal(
+                expected_Gp,
+                mc.Gp,
+            )
         )
 
         row[
             "public_generator_identity"
-        ] = Gpub_ok
+        ] = public_generator_ok
 
-        if not Gpub_ok:
+        if not public_generator_ok:
             raise RuntimeError(
-                "G_pub != (S G)[:,P]."
+                "G_pub != (SG)[:,P]."
             )
 
         print(
-            "  S G       = "
+            "  S G         = "
             f"{row['SG_multiplication_sec']:.6f} s"
         )
 
@@ -1585,53 +2202,64 @@ def profile_parameter_set(
         )
 
         # ==========================================================
-        # 11. Object memory/storage
-        #
-        # Record before ciphertext trials so these measurements are
-        # not affected by Patterson's conversion of polynomial data.
+        # 11. Memory/storage
         # ==========================================================
 
-        stage = "memory_measurement"
+        stage = (
+            "memory_measurement"
+        )
 
         print()
         print(
             "[11] Matrix memory/storage"
         )
 
-        G_stats = record_matrix_stats(
-            row,
-            "G",
-            mc.G,
+        G_stats = (
+            record_matrix_stats(
+                row,
+                "G",
+                mc.G,
+            )
         )
 
-        H_stats = record_matrix_stats(
-            row,
-            "H",
-            mc.H,
+        H_stats = (
+            record_matrix_stats(
+                row,
+                "H",
+                mc.H,
+            )
         )
 
-        S_stats = record_matrix_stats(
-            row,
-            "S",
-            mc.S,
+        S_stats = (
+            record_matrix_stats(
+                row,
+                "S",
+                mc.S,
+            )
         )
 
-        S_inv_stats = record_matrix_stats(
-            row,
-            "S_inv",
-            mc.S_inv,
+        S_inv_stats = (
+            record_matrix_stats(
+                row,
+                "S_inv",
+                mc.S_inv,
+            )
         )
 
-        Gpub_stats = record_matrix_stats(
-            row,
-            "Gpub",
-            mc.Gp,
+        Gpub_stats = (
+            record_matrix_stats(
+                row,
+                "Gpub",
+                mc.Gp,
+            )
         )
 
-        C_stats = record_matrix_stats(
-            row,
-            "C",
-            mc.right_inverse_core,
+        C_stats = (
+            record_matrix_stats(
+                row,
+                "C",
+                mc.right_inverse_core,
+            )
         )
 
         row[
@@ -1658,10 +2286,10 @@ def profile_parameter_set(
         row[
             "total_binary_packed_bytes"
         ] = sum(
-            stats[
+            item[
                 "packed"
             ]
-            for stats
+            for item
             in binary_stats
         )
 
@@ -1669,10 +2297,10 @@ def profile_parameter_set(
             "total_uint8_plus_J_bytes"
         ] = (
             sum(
-                stats[
+                item[
                     "uint8"
                 ]
-                for stats
+                for item
                 in binary_stats
             )
             +
@@ -1685,10 +2313,10 @@ def profile_parameter_set(
             "total_object_buffer_plus_J_bytes"
         ] = (
             sum(
-                stats[
+                item[
                     "object_buffer"
                 ]
-                for stats
+                for item
                 in binary_stats
             )
             +
@@ -1701,10 +2329,10 @@ def profile_parameter_set(
             "total_estimated_python_plus_J_bytes"
         ] = (
             sum(
-                stats[
+                item[
                     "estimated_python"
                 ]
-                for stats
+                for item
                 in binary_stats
             )
             +
@@ -1716,10 +2344,12 @@ def profile_parameter_set(
         (
             private_npz_bytes,
             public_npz_bytes,
-        ) = measure_npz_sizes(
-            mc,
-            g_storage,
-            irr_storage,
+        ) = (
+            measure_npz_sizes(
+                mc,
+                g_storage,
+                irr_storage,
+            )
         )
 
         row[
@@ -1738,11 +2368,6 @@ def profile_parameter_set(
         print(
             "  uint8 + J total      = "
             f"{row['total_uint8_plus_J_bytes'] / 2**20:.3f} MiB"
-        )
-
-        print(
-            "  object-buffer + J    = "
-            f"{row['total_object_buffer_plus_J_bytes'] / 2**20:.3f} MiB"
         )
 
         print(
@@ -1765,10 +2390,12 @@ def profile_parameter_set(
         ] = current_rss_mib()
 
         # ==========================================================
-        # 7-10. Encryption / Patterson / extraction / decryption
+        # 7-10. Ciphertext operations
         # ==========================================================
 
-        stage = "ciphertext_trials"
+        stage = (
+            "ciphertext_trials"
+        )
 
         print()
         print(
@@ -1794,63 +2421,74 @@ def profile_parameter_set(
         ):
             print()
             print(
-                f"  Trial {trial}/{trials}"
+                f"  Trial "
+                f"{trial}/{trials}"
             )
 
-            message = np.random.randint(
-                0,
-                2,
-                size=k,
-                dtype=np.uint8,
+            message = (
+                np.random
+                .randint(
+                    0,
+                    2,
+                    size=k,
+                    dtype=np.uint8,
+                )
             )
 
             # ------------------------------------------------------
-            # 7. Encryption.
+            # 7. Encryption
             # ------------------------------------------------------
 
-            start = time.perf_counter()
-
-            ciphertext = mc.encrypt(
-                message
+            start = (
+                time.perf_counter()
             )
 
-            encryption_time = seconds_since(
-                start
+            ciphertext = (
+                mc.encrypt(
+                    message
+                )
+            )
+
+            encryption_time = (
+                seconds_since(
+                    start
+                )
             )
 
             encryption_times.append(
                 encryption_time
             )
 
-            print(
-                "    encryption          = "
-                f"{encryption_time:.6f} s"
-            )
-
             # ------------------------------------------------------
-            # Secret-coordinate received word.
+            # Secret-coordinate ciphertext
             # ------------------------------------------------------
 
             secret_ct = (
-                mc._permute_vector(
+                mc
+                ._permute_vector(
                     ciphertext,
                     mc.P_inv,
                 )
             )
 
             # ------------------------------------------------------
-            # Syndrome timing.
+            # Syndrome
             # ------------------------------------------------------
 
-            start = time.perf_counter()
+            start = (
+                time.perf_counter()
+            )
 
             syndrome = (
                 secret_ct
-                * mc.H.T()
+                *
+                mc.H.T()
             )
 
-            syndrome_time = seconds_since(
-                start
+            syndrome_time = (
+                seconds_since(
+                    start
+                )
             )
 
             syndrome_times.append(
@@ -1858,11 +2496,7 @@ def profile_parameter_set(
             )
 
             # ------------------------------------------------------
-            # 8. Patterson correction.
-            #
-            # Reset polynomial representation for each trial. This
-            # includes the same conversion path a freshly loaded key
-            # would encounter.
+            # 8. Patterson
             # ------------------------------------------------------
 
             mc.g_poly = (
@@ -1874,18 +2508,26 @@ def profile_parameter_set(
             )
 
             working_word = GF2Matrix(
-                secret_ct.arr.copy()
+                secret_ct
+                .arr
+                .copy()
             )
 
-            start = time.perf_counter()
-
-            corrected = mc.repair_errors(
-                working_word,
-                syndrome,
+            start = (
+                time.perf_counter()
             )
 
-            patterson_time = seconds_since(
-                start
+            corrected = (
+                mc.repair_errors(
+                    working_word,
+                    syndrome,
+                )
+            )
+
+            patterson_time = (
+                seconds_since(
+                    start
+                )
             )
 
             patterson_times.append(
@@ -1894,11 +2536,14 @@ def profile_parameter_set(
 
             repaired_syndrome = (
                 corrected
-                * mc.H.T()
+                *
+                mc.H.T()
             )
 
-            patterson_ok = matrix_is_zero(
-                repaired_syndrome
+            patterson_ok = (
+                matrix_is_zero(
+                    repaired_syndrome
+                )
             )
 
             all_patterson_ok = (
@@ -1907,38 +2552,30 @@ def profile_parameter_set(
                 patterson_ok
             )
 
-            print(
-                "    syndrome            = "
-                f"{syndrome_time:.6f} s"
-            )
-
-            print(
-                "    Patterson           = "
-                f"{patterson_time:.6f} s "
-                f"(valid={patterson_ok})"
-            )
-
             if not patterson_ok:
                 raise RuntimeError(
                     "Patterson correction failed."
                 )
 
             # ------------------------------------------------------
-            # 9. Factorized extraction.
-            #
-            #     a = corrected[J] C.
+            # 9. Factorized extraction
             # ------------------------------------------------------
 
-            start = time.perf_counter()
+            start = (
+                time.perf_counter()
+            )
 
             extracted = (
-                mc._extract_information_vector(
+                mc
+                ._extract_information_vector(
                     corrected
                 )
             )
 
-            extraction_time = seconds_since(
-                start
+            extraction_time = (
+                seconds_since(
+                    start
+                )
             )
 
             extraction_times.append(
@@ -1949,12 +2586,15 @@ def profile_parameter_set(
                 GF2Matrix.from_list(
                     message
                 )
-                * mc.S
+                *
+                mc.S
             )
 
-            extraction_ok = matrix_equal(
-                extracted,
-                expected_scrambled,
+            extraction_ok = (
+                matrix_equal(
+                    extracted,
+                    expected_scrambled,
+                )
             )
 
             all_extraction_ok = (
@@ -1963,55 +2603,53 @@ def profile_parameter_set(
                 extraction_ok
             )
 
-            print(
-                "    factor extraction   = "
-                f"{extraction_time:.6f} s "
-                f"(valid={extraction_ok})"
-            )
-
             if not extraction_ok:
                 raise RuntimeError(
                     "Factorized extraction failed."
                 )
 
             # ------------------------------------------------------
-            # S^{-1} multiplication.
+            # S^{-1}
             # ------------------------------------------------------
 
-            start = time.perf_counter()
+            start = (
+                time.perf_counter()
+            )
 
             manual_plaintext = (
                 extracted
-                * mc.S_inv
+                *
+                mc.S_inv
             )
 
-            unscramble_time = seconds_since(
-                start
+            unscramble_time = (
+                seconds_since(
+                    start
+                )
             )
 
             unscramble_times.append(
                 unscramble_time
             )
 
-            manual_ok = vector_equal(
-                manual_plaintext
-                .to_numpy()
-                .astype(
-                    np.uint8
-                ),
-                message,
+            manual_ok = (
+                vector_equal(
+                    manual_plaintext
+                    .to_numpy()
+                    .astype(
+                        np.uint8
+                    ),
+                    message,
+                )
             )
 
             if not manual_ok:
                 raise RuntimeError(
-                    "S^{-1} message recovery failed."
+                    "S^{-1} recovery failed."
                 )
 
             # ------------------------------------------------------
-            # 10. Total decryption.
-            #
-            # Reset polynomial storage before timing so every trial
-            # represents the cold/private-key-array state.
+            # 10. Full decrypt
             # ------------------------------------------------------
 
             mc.g_poly = (
@@ -2022,10 +2660,14 @@ def profile_parameter_set(
                 irr_storage.copy()
             )
 
-            start = time.perf_counter()
+            start = (
+                time.perf_counter()
+            )
 
-            decoded = mc.decrypt(
-                ciphertext
+            decoded = (
+                mc.decrypt(
+                    ciphertext
+                )
             )
 
             total_decryption_time = (
@@ -2038,9 +2680,11 @@ def profile_parameter_set(
                 total_decryption_time
             )
 
-            decryption_ok = vector_equal(
-                decoded,
-                message,
+            decryption_ok = (
+                vector_equal(
+                    decoded,
+                    message,
+                )
             )
 
             all_decryption_ok = (
@@ -2053,12 +2697,34 @@ def profile_parameter_set(
                 successful_trials += 1
 
             print(
-                "    S^-1 multiply       = "
+                "    encryption         = "
+                f"{encryption_time:.6f} s"
+            )
+
+            print(
+                "    syndrome           = "
+                f"{syndrome_time:.6f} s"
+            )
+
+            print(
+                "    Patterson          = "
+                f"{patterson_time:.6f} s "
+                f"(valid={patterson_ok})"
+            )
+
+            print(
+                "    factor extraction  = "
+                f"{extraction_time:.6f} s "
+                f"(valid={extraction_ok})"
+            )
+
+            print(
+                "    S^-1 multiply      = "
                 f"{unscramble_time:.6f} s"
             )
 
             print(
-                "    total decryption    = "
+                "    total decryption   = "
                 f"{total_decryption_time:.6f} s "
                 f"(valid={decryption_ok})"
             )
@@ -2186,63 +2852,82 @@ def profile_parameter_set(
             "status"
         ] = "PASS"
 
+        # ==========================================================
+        # Summary
+        # ==========================================================
+
         print()
-        print("-" * 88)
+        print(
+            "-" * 96
+        )
 
         print(
             "PARAMETER-SET SUMMARY"
         )
 
-        print("-" * 88)
+        print(
+            "-" * 96
+        )
 
         print(
-            f"  (m,n,t,k)              = "
+            f"  (m,n,t,k)            = "
             f"({m},{n},{t},{k})"
         )
 
         print(
-            f"  rate                   = "
+            f"  rate                 = "
             f"{row['rate']:.6f}"
         )
 
         print(
-            "  construction wall      = "
+            "  Goppa polynomial     = "
+            f"{row['goppa_polynomial_sec']:.6f} s"
+        )
+
+        print(
+            "  first-root fraction  = "
+            f"{row['goppa_first_root_pct']:.2f}%"
+        )
+
+        print(
+            "  support-check frac.  = "
+            f"{row['goppa_final_support_verification_pct']:.2f}%"
+        )
+
+        print(
+            "  construction wall    = "
             f"{row['construction_wall_sec']:.6f} s"
         )
 
         print(
-            "  encryption avg         = "
+            "  encryption avg       = "
             f"{row['encryption_avg_sec']:.6f} s"
         )
 
         print(
-            "  Patterson avg          = "
+            "  Patterson avg        = "
             f"{row['patterson_avg_sec']:.6f} s"
         )
 
         print(
-            "  extraction avg         = "
+            "  extraction avg       = "
             f"{row['factorized_extraction_avg_sec']:.6f} s"
         )
 
         print(
-            "  total decryption avg   = "
+            "  total decrypt avg    = "
             f"{row['total_decryption_avg_sec']:.6f} s"
         )
 
         print(
-            "  current RSS            = "
-            f"{row['rss_after_trials_mib']:.2f} MiB"
-        )
-
-        print(
-            "  peak RSS               = "
+            "  peak RSS             = "
             f"{row['peak_rss_mib']:.2f} MiB"
         )
 
         print(
-            f"  correctness            = "
-            f"{successful_trials}/{trials} PASS"
+            f"  correctness          = "
+            f"{successful_trials}/"
+            f"{trials} PASS"
         )
 
         return row
@@ -2259,29 +2944,66 @@ def profile_parameter_set(
         row[
             "error_message"
         ] = (
-            f"{type(exc).__name__}: {exc}"
+            f"{type(exc).__name__}: "
+            f"{exc}"
         )
 
         row[
             "peak_rss_mib"
         ] = peak_rss_mib()
 
+        # If failure occurred inside Goppa generation, preserve
+        # whatever partial profile was accumulated.
+        if (
+            "generator"
+            in locals()
+            and
+            hasattr(
+                generator,
+                "goppa_profile",
+            )
+        ):
+            try:
+                external_total = row.get(
+                    "goppa_polynomial_sec",
+                    generator
+                    .goppa_profile
+                    .get(
+                        "total_sec",
+                        0.0,
+                    ),
+                )
+
+                copy_goppa_profile_to_row(
+                    row,
+                    generator.goppa_profile,
+                    external_total,
+                )
+
+            except Exception:
+                pass
+
         print()
-        print("!" * 88)
+        print(
+            "!" * 96
+        )
 
         print(
             "PARAMETER SET FAILED"
         )
 
-        print("!" * 88)
+        print(
+            "!" * 96
+        )
 
         print(
             f"  stage = {stage}"
         )
 
         print(
-            f"  error = "
-            f"{type(exc).__name__}: {exc}"
+            "  error = "
+            f"{type(exc).__name__}: "
+            f"{exc}"
         )
 
         traceback.print_exc()
@@ -2301,13 +3023,18 @@ def print_final_summary(
     csv_path,
 ):
     print()
-    print("=" * 100)
-
     print(
-        "PHASE 2E SCALING SUMMARY"
+        "=" * 110
     )
 
-    print("=" * 100)
+    print(
+        "PHASE 2E.1 GOPPA-POLYNOMIAL "
+        "PROFILING SUMMARY"
+    )
+
+    print(
+        "=" * 110
+    )
 
     for row in rows:
         status = row.get(
@@ -2336,37 +3063,24 @@ def print_final_summary(
         )
 
         if status == "PASS":
-            construction = float(
-                row[
-                    "construction_wall_sec"
-                ]
-            )
-
-            decryption = float(
-                row[
-                    "total_decryption_avg_sec"
-                ]
-            )
-
-            rss = float(
-                row[
-                    "peak_rss_mib"
-                ]
-            )
-
             print(
-                f"(m,n,t)=({m},{n},{t}) "
+                f"(m,n,t)="
+                f"({m},{n},{t}) "
                 f"k={k} "
-                f"construction={construction:.3f}s "
-                f"decrypt={decryption:.6f}s "
-                f"peakRSS={rss:.1f}MiB "
+                f"g={float(row['goppa_polynomial_sec']):.3f}s "
+                f"root="
+                f"{float(row['goppa_first_root_pct']):.1f}% "
+                f"verify="
+                f"{float(row['goppa_final_support_verification_pct']):.1f}% "
+                f"attempts="
+                f"{row['goppa_candidate_attempts']} "
                 f"PASS"
             )
 
         else:
             print(
-                f"(m,n,t)=({m},{n},{t}) "
-                f"k={k} "
+                f"(m,n,t)="
+                f"({m},{n},{t}) "
                 f"FAIL at "
                 f"{row.get('error_stage', '?')}: "
                 f"{row.get('error_message', '')}"
@@ -2378,19 +3092,20 @@ def print_final_summary(
     )
 
     print(
-        f"  {Path(csv_path).resolve()}"
+        f"  "
+        f"{Path(csv_path).resolve()}"
     )
 
 
 # ======================================================================
-# Command-line interface
+# CLI
 # ======================================================================
 
 def parse_args():
-
     parser = argparse.ArgumentParser(
         description=(
-            "Phase 2E detailed McEliece scaling profiler."
+            "Phase 2E.1 detailed "
+            "Goppa-polynomial profiler."
         )
     )
 
@@ -2399,8 +3114,9 @@ def parse_args():
         type=int,
         default=None,
         help=(
-            "Run only one parameter-set index "
-            "(0,1,2,3). Default: run all."
+            "Run one parameter-set index "
+            "(0,1,2,3). "
+            "Default: run all."
         ),
     )
 
@@ -2417,7 +3133,8 @@ def parse_args():
         "--reset-csv",
         action="store_true",
         help=(
-            "Delete the existing CSV before running."
+            "Delete existing output CSV "
+            "before running."
         ),
     )
 
@@ -2425,8 +3142,7 @@ def parse_args():
         "--quick",
         action="store_true",
         help=(
-            "Use one ciphertext trial for every "
-            "parameter set."
+            "Use one ciphertext trial."
         ),
     )
 
@@ -2434,7 +3150,6 @@ def parse_args():
 
 
 def main():
-
     args = parse_args()
 
     csv_path = Path(
@@ -2448,27 +3163,26 @@ def main():
     ):
         csv_path.unlink()
 
-    if args.index is not None:
-
-        matching = [
-            params
-            for params
-            in PARAMETER_SETS
-            if params[0] == args.index
-        ]
-
-        if not matching:
-            raise ValueError(
-                "index must be one of "
-                "0, 1, 2, 3."
-            )
-
-        selected_sets = matching
-
-    else:
+    if args.index is None:
         selected_sets = (
             PARAMETER_SETS
         )
+
+    else:
+        selected_sets = [
+            params
+            for params
+            in PARAMETER_SETS
+            if params[0]
+            ==
+            args.index
+        ]
+
+        if not selected_sets:
+            raise ValueError(
+                "--index must be "
+                "0, 1, 2, or 3."
+            )
 
     rows = []
 
@@ -2480,24 +3194,25 @@ def main():
         configured_trials,
     ) in selected_sets:
 
-        if args.quick:
-            trials = 1
-        else:
-            trials = (
-                configured_trials
-            )
+        trials = (
+            1
+            if args.quick
+            else configured_trials
+        )
 
-        row = profile_parameter_set(
-            index=index,
-            m=m,
-            n=n,
-            t=t,
-            trials=trials,
-            seed=(
-                BASE_SEED
-                +
-                index
-            ),
+        row = (
+            profile_parameter_set(
+                index=index,
+                m=m,
+                n=n,
+                t=t,
+                trials=trials,
+                seed=(
+                    BASE_SEED
+                    +
+                    index
+                ),
+            )
         )
 
         append_csv_row(
@@ -2514,7 +3229,6 @@ def main():
             "Result written to CSV."
         )
 
-        # Release parameter-specific objects before continuing.
         gc.collect()
 
     print_final_summary(
