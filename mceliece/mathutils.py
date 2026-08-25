@@ -27,82 +27,154 @@ def is_irreducible_poly(poly, p):
     return gf_irreducible_p([int(c) for c in poly.all_coeffs()], p, ZZ)
 
 
-def first_alpha_power_root(poly, irr_poly, p, elements_to_check=None):
+def first_alpha_power_root(
+    poly,
+    irr_poly,
+    p,
+    elements_to_check=None,
+):
     """
-    Return the first i > 0 such that alpha^i is a root of poly
-    in GF(p^m) = GF(p)[alpha] / (irr_poly).
+    Return the first i > 0 such that alpha^i is a root of ``poly``
+    in
 
-    All reductions in alpha are performed over GF(p), avoiding
-    mixed ZZ/GF(p) polynomial domains in modern SymPy.
+        GF(p^m) = GF(p)[alpha] / (irr_poly).
+
+    Evaluation is performed directly in the quotient ring using
+    Horner's rule.  This avoids symbolic substitution and expansion
+    in SymPy, which becomes prohibitively expensive for larger
+    Goppa parameters.
+
+    If ``elements_to_check`` is supplied, only exponents contained
+    in that collection are tested.
     """
+
     field = GF(p)
-    irr_poly = irr_poly.set_domain(field)
 
-    # Reduce every coefficient of poly modulo irr_poly over GF(p).
-    reduced_coeffs = []
+    irr_poly = Poly(
+        irr_poly.as_expr(),
+        alpha,
+        domain=field,
+    )
+
+    # --------------------------------------------------------------
+    # Convert the coefficients of the polynomial in x into reduced
+    # representatives of GF(p)[alpha] / (irr_poly).
+    #
+    # poly.all_coeffs() returns coefficients from highest degree
+    # to constant coefficient, which is exactly the order required
+    # for Horner evaluation.
+    # --------------------------------------------------------------
+
+    coefficient_polys = []
 
     for coeff in poly.all_coeffs():
+
         coeff_poly = Poly(
             coeff,
             alpha,
-            domain=field
+            domain=field,
+        ).rem(
+            irr_poly
         )
 
-        coeff_poly = coeff_poly.rem(irr_poly)
-
-        reduced_coeffs.append(
-            coeff_poly.as_expr()
+        coefficient_polys.append(
+            coeff_poly
         )
 
-    # Polynomial in x whose coefficients are represented
-    # as reduced polynomials in alpha.
-    poly = Poly(reduced_coeffs, x)
-
-    test_poly = Poly(
-        1,
-        alpha,
-        domain=field
-    )
+    # --------------------------------------------------------------
+    # alpha itself in the quotient ring.
+    # --------------------------------------------------------------
 
     alpha_poly = Poly(
         alpha,
         alpha,
-        domain=field
+        domain=field,
+    ).rem(
+        irr_poly
     )
 
-    log.debug(f"testing f:{poly}")
+    # test_poly will hold alpha^i mod irr_poly.
+    test_poly = Poly(
+        1,
+        alpha,
+        domain=field,
+    )
+
+    zero_poly = Poly(
+        0,
+        alpha,
+        domain=field,
+    )
+
+    extension_size = (
+        int(p)
+        **
+        int(irr_poly.degree())
+    )
+
+    # Convert once so membership testing is efficient.
+    if elements_to_check is not None:
+        elements_to_check = set(
+            int(i)
+            for i in elements_to_check
+        )
+
+    log.debug(
+        "testing first alpha-power root "
+        f"for polynomial of degree {poly.degree()}"
+    )
+
+    # --------------------------------------------------------------
+    # Test alpha^1, ..., alpha^(p^m - 1).
+    # --------------------------------------------------------------
 
     for i in range(
         1,
-        p ** irr_poly.degree()
+        extension_size,
     ):
-        # alpha^i modulo irr_poly
+
+        # alpha^i mod irr_poly
         test_poly = (
-            alpha_poly * test_poly
-        ).rem(irr_poly)
+            alpha_poly
+            *
+            test_poly
+        ).rem(
+            irr_poly
+        )
 
         if (
             elements_to_check is not None
-            and i not in elements_to_check
+            and
+            i not in elements_to_check
         ):
             continue
 
-        # Evaluate f(alpha^i).
-        value_expr = poly.as_expr().subs(
-            x,
-            test_poly.as_expr()
-        )
+        # ----------------------------------------------------------
+        # Horner evaluation:
+        #
+        # value =
+        #   (...((c_0*y + c_1)*y + c_2)*y + ... + c_d)
+        #
+        # with every operation reduced modulo irr_poly.
+        # ----------------------------------------------------------
 
-        # Reduce the result modulo irr_poly over GF(p).
-        value = Poly(
-            value_expr,
-            alpha,
-            domain=field
-        ).rem(irr_poly)
+        value = zero_poly
+
+        for coeff_poly in coefficient_polys:
+
+            value = (
+                value
+                *
+                test_poly
+                +
+                coeff_poly
+            ).rem(
+                irr_poly
+            )
 
         log.debug(
-            f"testing alpha^{i} "
-            f"f({test_poly})={value}"
+            f"testing alpha^{i}: "
+            f"value={value}"
         )
 
         if value.is_zero:

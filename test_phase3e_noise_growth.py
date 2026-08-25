@@ -1092,7 +1092,7 @@ def run_fused_noise_sweep(
                 he.generate_evaluation_key(
                     tau_F=tau_F,
                     batch_size=64,
-                    max_pairs=200000,
+                    max_pairs=1200000,
                     progress=False,
                     set_default=False,
                 )
@@ -1649,7 +1649,7 @@ def run_parameter_set(
         he.generate_evaluation_key(
             tau_F=0,
             batch_size=64,
-            max_pairs=200000,
+            max_pairs=1200000,
             progress=False,
             set_default=False,
         )
@@ -1681,8 +1681,8 @@ def run_parameter_set(
             parameter_index=parameter_index,
             he=he,
             clean_evk=clean_evk,
-            trials=input_trials,
-            csv_filename=csv_filename,
+            trials=args.input_trials,
+            csv_filename=args.csv,
         )
     )
 
@@ -1699,7 +1699,7 @@ def run_parameter_set(
     tau_values = list(
         range(
             0,
-            tau_f_max + 1,
+            args.tau_f_max + 1,
         )
     )
 
@@ -1707,8 +1707,8 @@ def run_parameter_set(
         parameter_index=parameter_index,
         he=he,
         tau_values=tau_values,
-        trials=sweep_trials,
-        csv_filename=csv_filename,
+        trials=args.sweep_trials,
+        csv_filename=args.csv,
     )
 
     print()
